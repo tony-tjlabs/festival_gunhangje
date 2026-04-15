@@ -887,11 +887,16 @@ def render_weather(data: dict) -> None:
 @st.cache_data(show_spinner=False)
 def _load_ai_insights() -> dict:
     """사전 생성된 ai_insights.json 로드."""
+    import json, re
     p = BASE_DIR / "cache" / "ai_insights.json"
-    if p.exists():
-        import json
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {}
+    if not p.exists():
+        return {}
+    raw = p.read_text(encoding="utf-8")
+    # 테이블 셀 단독 '-' → '─' (마크다운 separator row 오인 방지)
+    raw = re.sub(r'\| - \|', '| ─ |', raw)
+    # 수학 마이너스(U+2212) → 하이픈으로 정규화
+    raw = raw.replace('\u2212', '-')
+    return json.loads(raw)
 
 
 def render_ai(data: dict) -> None:
