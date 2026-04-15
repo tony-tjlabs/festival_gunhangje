@@ -911,8 +911,8 @@ def render_ai(data: dict) -> None:
         st.warning("AI 인사이트 파일을 찾을 수 없습니다. (cache/ai_insights.json)")
         return
 
-    subtab_period, subtab_single, subtab_weather, subtab_zone, subtab_ast = st.tabs(
-        ["전체기간 종합", "단일 날짜 분석", "날씨 영향 분석", "구역 심층 분석", "체류시간 패턴"]
+    subtab_period, subtab_single, subtab_weather, subtab_zone = st.tabs(
+        ["전체기간 종합", "단일 날짜 분석", "날씨 영향 분석", "구역 심층 분석"]
     )
 
     # ── 전체기간 종합 ────────────────────────────────────────────────────────
@@ -956,11 +956,6 @@ def render_ai(data: dict) -> None:
             st.markdown(result)
         else:
             st.info(f"{zone_date} 구역 분석 결과가 없습니다.")
-
-    # ── 체류시간 패턴 분석 ──────────────────────────────────────────────────
-    with subtab_ast:
-        st.subheader("누적 체류시간 패턴 분석")
-        st.markdown(insights.get("ast_pattern", "분석 결과가 없습니다."))
 
     st.markdown("---")
     st.caption("AI 분석은 사전 생성된 결과를 표시합니다. (claude-haiku-4-5, 2026-04-15 생성)")
