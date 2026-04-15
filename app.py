@@ -71,6 +71,23 @@ div[data-testid="stSidebarContent"] h2 { color: #e5604a; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── 비밀번호 인증 ─────────────────────────────────────────────────────────────
+_APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title(APP_ICON + " " + APP_TITLE)
+    pw = st.text_input("비밀번호를 입력하세요", type="password", key="pw_input")
+    if pw:
+        if pw == _APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+    st.stop()
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # 헬퍼
