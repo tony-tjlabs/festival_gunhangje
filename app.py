@@ -9,7 +9,7 @@
 5. 날씨 영향   — 날씨별 박스플롯, 기온/강수 산점도, 날씨별 시간 패턴
 6. AI 인사이트  — 전체기간 / 단일날짜 / 날씨영향 Claude API 분석
 
-배포: Streamlit Cloud (cache/*.parquet 번들, raw CSV 없음)
+실행: streamlit run app.py --server.port 8560
 """
 from __future__ import annotations
 
@@ -28,15 +28,8 @@ from config import (
     ALL_ZONES, APP_ICON, APP_TITLE,
     DOW_KO, FESTIVAL_END, FESTIVAL_START,
     ZONE_LABELS,
-    CACHE_DAILY, CACHE_HOURLY, CACHE_ZONE_HOURLY, CACHE_INFLOW,
-    CACHE_FINE_5MIN, CACHE_DAILY_AST, CACHE_HOURLY_AST,
-    CACHE_SWARD_HOURLY, CACHE_FLOW,
 )
 from weather import fetch_weather, make_date_label
-from llm_analyzer import (
-    analyze_single_day, analyze_full_period, analyze_weather_impact,
-    analyze_zone_deep, analyze_ast_pattern,
-)
 from charts import (
     # 탭 1
     chart_daily_trend, chart_dow_avg, chart_weather_udc_box,
@@ -62,7 +55,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ── Streamlit 설정 ───────────────────────────────────────────────────────────
-# (set_page_config은 인증 체크보다 먼저 호출해야 함)
 st.set_page_config(
     page_title            = APP_TITLE,
     page_icon             = APP_ICON,
@@ -78,23 +70,6 @@ st.markdown("""
 div[data-testid="stSidebarContent"] h2 { color: #e5604a; }
 </style>
 """, unsafe_allow_html=True)
-
-# ── 비밀번호 인증 (Streamlit Cloud secrets) ──────────────────────────────────
-_APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.markdown(f"## {APP_ICON} {APP_TITLE}")
-    pw = st.text_input("비밀번호를 입력하세요", type="password", key="pw_input")
-    if pw:
-        if pw == _APP_PASSWORD:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("비밀번호가 올바르지 않습니다.")
-    st.stop()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -114,12 +89,17 @@ def _load_swards() -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 데이터 로드 (Release: 전처리 없음 — 번들 parquet 직접 로드)
+# 데이터 로드
 # ════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(show_spinner="데이터 로딩 중...")
+@st.cache_data(show_spinner=False)
 def _load_all() -> dict:
-    """번들 Parquet 캐시 로드 + 날씨 데이터 포함 통합 dict 반환."""
+    """캐시 parquet 직접 로드 + 날씨 데이터 포함 통합 dict 반환."""
+    from config import (
+        CACHE_DAILY, CACHE_HOURLY, CACHE_ZONE_HOURLY, CACHE_INFLOW,
+        CACHE_FINE_5MIN, CACHE_DAILY_AST, CACHE_HOURLY_AST,
+        CACHE_SWARD_HOURLY, CACHE_FLOW,
+    )
     cache_dir = BASE_DIR / "cache"
     data = {
         "daily":        pd.read_parquet(cache_dir / CACHE_DAILY),
@@ -132,8 +112,6 @@ def _load_all() -> dict:
         "sward_hourly": pd.read_parquet(cache_dir / CACHE_SWARD_HOURLY),
         "flow":         pd.read_parquet(cache_dir / CACHE_FLOW),
     }
-
-    # ── 날씨 데이터 (Open-Meteo 무료 API) ────────────────────────────────────
     daily_df = data["daily"]
     if not daily_df.empty:
         weather_df = fetch_weather(daily_df["date"].min(), daily_df["date"].max())
@@ -144,127 +122,23 @@ def _load_all() -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 캐시된 KPI 헬퍼 — 탭 전환 시 재계산 방지
-# ════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(show_spinner=False)
-def _compute_overview_kpis(
-    daily_df: pd.DataFrame,
-    daily_ast_df: pd.DataFrame,
-) -> dict:
-    """개요 탭 KPI 전체를 한 번만 계산 후 캐시."""
-    festival_df = daily_df[daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
-    non_fest_df = daily_df[~daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
-
-    def _ratio(df: pd.DataFrame) -> tuple[float, float]:
-        if df.empty:
-            return 0.0, 0.0
-        ios_s = int(df["ios_udc"].sum())
-        and_s = int(df["android_udc"].sum())
-        tot   = ios_s + and_s
-        return (round(ios_s / tot * 100, 1), round(and_s / tot * 100, 1)) if tot else (0.0, 0.0)
-
-    peak_idx  = daily_df["udc"].idxmax()
-    peak_day  = daily_df.loc[peak_idx]
-    peak_ast_row = (daily_ast_df.loc[daily_ast_df["ast_hours"].idxmax()]
-                    if not daily_ast_df.empty else None)
-    return {
-        "avg_festival":       int(festival_df["udc"].mean()) if not festival_df.empty else 0,
-        "avg_non_fest":       int(non_fest_df["udc"].mean()) if not non_fest_df.empty else 0,
-        "total_udc":          int(daily_df["udc"].sum()),
-        "peak_day_date":      str(peak_day["date"]),
-        "peak_day_udc":       int(peak_day["udc"]),
-        "total_ast_h":        round(float(daily_ast_df["ast_hours"].sum()), 1) if not daily_ast_df.empty else 0.0,
-        "peak_ast_h":         round(float(peak_ast_row["ast_hours"]), 1) if peak_ast_row is not None else 0.0,
-        "peak_ast_date":      str(peak_ast_row["date"]) if peak_ast_row is not None else "",
-        "fest_ios_pct":       _ratio(festival_df)[0],
-        "fest_and_pct":       _ratio(festival_df)[1],
-        "non_fest_ios_pct":   _ratio(non_fest_df)[0],
-        "non_fest_and_pct":   _ratio(non_fest_df)[1],
-    }
-
-
-@st.cache_data(show_spinner=False)
-def _compute_inflow_kpis(
-    fine_5min_df: pd.DataFrame,
-    selected_date: str,
-    resolution: int,
-) -> dict:
-    """유입/유출 탭 KPI — 날짜·해상도별 캐시."""
-    import numpy as np
-    sub = fine_5min_df[fine_5min_df["date"] == selected_date].sort_values("bin_5min")
-    if sub.empty:
-        return {}
-    bins_pw = resolution // 5
-    sub     = sub.copy()
-    sub["win"] = sub["bin_5min"] // bins_pw
-    agg   = sub.groupby("win")["corrected_dc"].mean()
-    delta = agg.diff().dropna()
-    return {
-        "peak_occ_val":  int(agg.max()),
-        "peak_occ_time": int(agg.idxmax()) * resolution,
-        "peak_in_val":   int(delta[delta > 0].max()) if (delta > 0).any() else 0,
-        "peak_in_time":  int(delta.idxmax()) * resolution if not delta.empty else 0,
-        "peak_out_val":  int(delta[delta < 0].min()) if (delta < 0).any() else 0,
-        "peak_out_time": int(delta.idxmin()) * resolution if not delta.empty else 0,
-    }
-
-
-@st.cache_data(show_spinner=False)
-def _zone_dc_html(
-    sward_hourly_df: pd.DataFrame,
-    zone_df: pd.DataFrame,
-    map_date: str,
-    map_hour: int,
-    is_cumulative: bool,
-) -> str:
-    """구역별 DC 요약 HTML — 슬라이더 조작마다 재생성 방지."""
-    from config import ZONE_LABELS, ZONE_COLORS
-    if is_cumulative:
-        zh_raw = (
-            zone_df[(zone_df["date"] == map_date) & (zone_df["hour"] <= map_hour)]
-            .groupby("zone")["dc"].sum()
-            .reset_index()
-            .sort_values("dc", ascending=False)
-        )
-    else:
-        zh_raw = (
-            zone_df[(zone_df["date"] == map_date) & (zone_df["hour"] == map_hour)]
-            .sort_values("dc", ascending=False)
-        )
-    if zh_raw.empty:
-        return "<p style='color:#888;font-size:0.82rem;'>데이터 없음</p>"
-    # 벡터화: iterrows 제거 → 문자열 리스트 생성
-    rows_html = []
-    for zone, dc_v in zip(zh_raw["zone"], zh_raw["dc"]):
-        label = ZONE_LABELS.get(zone, zone)
-        color = ZONE_COLORS.get(zone, "#888888")
-        rows_html.append(
-            f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">'
-            f'<div style="width:10px;height:10px;border-radius:50%;'
-            f'background:{color};flex-shrink:0;"></div>'
-            f'<span style="font-size:0.82rem;">{label}</span>'
-            f'<span style="margin-left:auto;font-weight:600;'
-            f'font-size:0.85rem;">{int(dc_v):,}</span></div>'
-        )
-    return "\n".join(rows_html)
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # 사이드바
 # ════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar() -> dict:
+def render_sidebar() -> dict | None:
     with st.sidebar:
         st.title(APP_ICON + " 군항제 대시보드")
         st.markdown("---")
 
+        # 축제 정보 (보정 수치 동적 표시)
         st.markdown("### 진해 군항제 2026")
         st.markdown("""
 - **사전기간**: 3/25(수) ~ 3/26(목)
 - **축제기간**: 3/27(금) ~ 4/5(일)  10일간
 - **분석 데이터**: 12일, BLE S-Ward 56개
 """)
+        st.markdown("---")
+
         st.markdown("---")
         st.caption("TJLABS · Festival Analytics v1.0")
 
@@ -313,19 +187,36 @@ def render_overview(data: dict) -> None:
 
     st.header("개요")
 
-    # ── KPI 계산 (캐시된 헬퍼 — 탭 재진입 시 재계산 없음) ───────────────────────
-    kpi = _compute_overview_kpis(daily_df, daily_ast_df)
-    avg_festival      = kpi["avg_festival"]
-    avg_non_fest      = kpi["avg_non_fest"]
-    total_udc         = kpi["total_udc"]
-    peak_label        = make_date_label(kpi["peak_day_date"], weather_df)
-    total_ast_h       = kpi["total_ast_h"]
-    peak_ast_h        = kpi["peak_ast_h"]
-    peak_ast_lbl      = make_date_label(kpi["peak_ast_date"], weather_df) if kpi["peak_ast_date"] else ""
-    fest_ios_pct      = kpi["fest_ios_pct"]
-    fest_and_pct      = kpi["fest_and_pct"]
-    non_fest_ios_pct  = kpi["non_fest_ios_pct"]
-    non_fest_and_pct  = kpi["non_fest_and_pct"]
+    # ── KPI 계산 ──────────────────────────────────────────────────────────────
+    festival_df   = daily_df[daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
+    non_fest_df   = daily_df[~daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
+
+    avg_festival  = int(festival_df["udc"].mean()) if not festival_df.empty else 0
+    avg_non_fest  = int(non_fest_df["udc"].mean()) if not non_fest_df.empty else 0
+    total_udc     = int(daily_df["udc"].sum())
+    peak_day      = daily_df.loc[daily_df["udc"].idxmax()]
+    peak_label    = make_date_label(peak_day["date"], weather_df)
+
+    total_ast_h   = round(daily_ast_df["ast_hours"].sum(), 1) if not daily_ast_df.empty else 0.0
+    peak_ast_row  = (daily_ast_df.loc[daily_ast_df["ast_hours"].idxmax()]
+                     if not daily_ast_df.empty else None)
+    peak_ast_h    = round(float(peak_ast_row["ast_hours"]), 1) if peak_ast_row is not None else 0.0
+    peak_ast_lbl  = (make_date_label(str(peak_ast_row["date"]), weather_df)
+                     if peak_ast_row is not None else "")
+
+    # iOS/Android 비율 계산 (축제기간 / 비축제기간 분리)
+    def _ratio(df: pd.DataFrame) -> tuple[float, float]:
+        if df.empty:
+            return 0.0, 0.0
+        ios_s = int(df["ios_udc"].sum())
+        and_s = int(df["android_udc"].sum())
+        tot   = ios_s + and_s
+        if tot == 0:
+            return 0.0, 0.0
+        return round(ios_s / tot * 100, 1), round(and_s / tot * 100, 1)
+
+    fest_ios_pct,     fest_and_pct     = _ratio(festival_df)
+    non_fest_ios_pct, non_fest_and_pct = _ratio(non_fest_df)
 
     # ── Row 1: 축제/비축제 일평균 DC, 전체 누적 체류시간, 피크일 누적 체류시간 ──
     c1, c2, c3, c4 = st.columns(4)
@@ -339,7 +230,7 @@ def render_overview(data: dict) -> None:
 
     # ── Row 2: 피크 일 DC, 전체 DC 합계 ─────────────────────────────────────
     c5, c6 = st.columns(2)
-    c5.metric("피크 일 DC", f"{kpi['peak_day_udc']:,}", delta=peak_label)
+    c5.metric("피크 일 DC", f"{int(peak_day['udc']):,}", delta=peak_label)
     c6.metric("전체 DC 합계", f"{total_udc:,}",
               help="전 기간 일별 Device Count 합산 (연인원 근사값)")
 
@@ -535,15 +426,22 @@ def render_inflow(data: dict) -> None:
             key="inflow_resolution",
         )
 
-    # ── KPI (캐시된 헬퍼 — 날짜/해상도 변경 시만 재계산) ─────────────────────
-    kpi = _compute_inflow_kpis(fine_5min_df, selected_date, resolution)
-    if kpi:
-        peak_occ_val  = kpi["peak_occ_val"]
-        peak_occ_time = kpi["peak_occ_time"]
-        peak_in_val   = kpi["peak_in_val"]
-        peak_in_time  = kpi["peak_in_time"]
-        peak_out_val  = kpi["peak_out_val"]
-        peak_out_time = kpi["peak_out_time"]
+    # ── KPI ────────────────────────────────────────────────────────────────
+    sub = fine_5min_df[fine_5min_df["date"] == selected_date].sort_values("bin_5min")
+    if not sub.empty:
+        import numpy as np
+        bins_pw    = resolution // 5
+        sub        = sub.copy()
+        sub["win"] = sub["bin_5min"] // bins_pw
+        agg        = sub.groupby("win")["corrected_dc"].mean()
+        delta      = agg.diff().dropna()
+
+        peak_occ_val  = int(agg.max())
+        peak_occ_time = int(agg.idxmax()) * resolution
+        peak_in_val   = int(delta[delta > 0].max()) if (delta > 0).any() else 0
+        peak_in_time  = int(delta.idxmax()) * resolution if not delta.empty else 0
+        peak_out_val  = int(delta[delta < 0].min()) if (delta < 0).any() else 0
+        peak_out_time = int(delta.idxmin()) * resolution if not delta.empty else 0
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("피크 Device Count",
@@ -656,15 +554,42 @@ def render_zone(data: dict) -> None:
             label_visibility="collapsed",
         )
 
-        # ── 해당 시간 구역별 DC 요약 (캐시된 HTML 렌더링) ───────────────────────
+        # ── 해당 시간 구역별 DC 요약 ─────────────────────────────────────────
         st.markdown("---")
         dc_label = f"00~{map_hour:02d}시 누적 DC" if is_cumulative else f"{map_hour:02d}시 구역별 DC"
         st.markdown(f"**{dc_label}**")
         if not sward_hourly_df.empty and not zone_df.empty:
-            st.markdown(
-                _zone_dc_html(sward_hourly_df, zone_df, map_date, map_hour, is_cumulative),
-                unsafe_allow_html=True,
-            )
+            from config import ZONE_LABELS, ZONE_COLORS
+            if is_cumulative:
+                zh_raw = zone_df[
+                    (zone_df["date"] == map_date) &
+                    (zone_df["hour"] <= map_hour)
+                ].groupby("zone")["dc"].sum().reset_index().sort_values("dc", ascending=False)
+            else:
+                zh_raw = zone_df[
+                    (zone_df["date"] == map_date) &
+                    (zone_df["hour"] == map_hour)
+                ].sort_values("dc", ascending=False)
+
+            if not zh_raw.empty:
+                for _, zrow in zh_raw.iterrows():
+                    zone  = zrow["zone"]
+                    label = ZONE_LABELS.get(zone, zone)
+                    color = ZONE_COLORS.get(zone, "#888888")
+                    dc_v  = int(zrow["dc"])
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:6px;'
+                        f'margin:3px 0;">'
+                        f'<div style="width:10px;height:10px;border-radius:50%;'
+                        f'background:{color};flex-shrink:0;"></div>'
+                        f'<span style="font-size:0.82rem;">{label}</span>'
+                        f'<span style="margin-left:auto;font-weight:600;'
+                        f'font-size:0.85rem;">{dc_v:,}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.caption("데이터 없음")
 
     # ── 좌측 지도 ─────────────────────────────────────────────────────────────
     with col_map:
@@ -942,18 +867,27 @@ def render_weather(data: dict) -> None:
 # 탭 6 — AI 인사이트
 # ════════════════════════════════════════════════════════════════════════════
 
-def render_ai(data: dict) -> None:
-    daily_df      = data["daily"]
-    hourly_df     = data["hourly"]
-    zone_df       = data["zone_hourly"]
-    inflow_df     = data["inflow"]
-    weather_df    = data["weather"]
-    daily_ast_df  = data.get("daily_ast")
-    hourly_ast_df = data.get("hourly_ast")
-    fine_5min_df  = data.get("fine_5min")
-    all_dates     = sorted(daily_df["date"].unique().tolist())
+@st.cache_data(show_spinner=False)
+def _load_ai_insights() -> dict:
+    """사전 생성된 ai_insights.json 로드."""
+    p = BASE_DIR / "cache" / "ai_insights.json"
+    if p.exists():
+        import json
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
 
-    st.header("AI 인사이트 (Claude API)")
+
+def render_ai(data: dict) -> None:
+    daily_df  = data["daily"]
+    weather_df = data["weather"]
+    all_dates = sorted(daily_df["date"].unique().tolist())
+
+    st.header("AI 인사이트")
+
+    insights = _load_ai_insights()
+    if not insights:
+        st.warning("AI 인사이트 파일을 찾을 수 없습니다. (cache/ai_insights.json)")
+        return
 
     subtab_period, subtab_single, subtab_weather, subtab_zone, subtab_ast = st.tabs(
         ["전체기간 종합", "단일 날짜 분석", "날씨 영향 분석", "구역 심층 분석", "체류시간 패턴"]
@@ -962,95 +896,52 @@ def render_ai(data: dict) -> None:
     # ── 전체기간 종합 ────────────────────────────────────────────────────────
     with subtab_period:
         st.subheader("전체 축제 기간 종합 분석")
-        st.markdown(
-            "군항제 전 기간(12일) 트래픽 데이터를 종합하여 핵심 패턴과 운영 인사이트를 제공합니다. "
-            "Device Count·누적 체류시간·유입유출·구역·날씨·요일 등 전체 데이터를 컨텍스트로 제공합니다."
-        )
-        if st.button("전체기간 AI 분석 실행", key="btn_period"):
-            with st.spinner("AI 분석 중 (최대 30초)..."):
-                result = analyze_full_period(
-                    daily_df, hourly_df, zone_df, inflow_df, weather_df,
-                    daily_ast_df=daily_ast_df,
-                    hourly_ast_df=hourly_ast_df,
-                )
-            st.markdown(result)
+        st.markdown(insights.get("full_period", "분석 결과가 없습니다."))
 
     # ── 단일 날짜 분석 ───────────────────────────────────────────────────────
     with subtab_single:
         st.subheader("단일 날짜 상세 분석")
-        st.markdown(
-            "선택한 날의 시간별 DC·누적 체류시간·5분 Device Count·유입유출·구역별 데이터를 모두 포함하여 분석합니다."
-        )
         selected_date = st.selectbox(
-            "분석할 날짜 선택",
+            "날짜 선택",
             options=all_dates,
             format_func=lambda d: make_date_label(d, weather_df),
             key="ai_single_date",
         )
-        if st.button("날짜 AI 분석 실행", key="btn_single"):
-            with st.spinner(f"{selected_date} 분석 중..."):
-                result = analyze_single_day(
-                    selected_date, daily_df, hourly_df, zone_df, inflow_df, weather_df,
-                    daily_ast_df=daily_ast_df,
-                    hourly_ast_df=hourly_ast_df,
-                    fine_5min_df=fine_5min_df,
-                )
+        single_day = insights.get("single_day", {})
+        result = single_day.get(selected_date)
+        if result:
             st.markdown(result)
+        else:
+            st.info(f"{selected_date} 분석 결과가 없습니다.")
 
     # ── 날씨 영향 분석 ───────────────────────────────────────────────────────
     with subtab_weather:
         st.subheader("날씨와 트래픽 상관 분석")
-        st.markdown(
-            "맑은 날과 비 오는 날의 트래픽 차이, 기온 구간별 분포, 요일 교란 통제 후 순수 날씨 효과를 분석합니다."
-        )
-        if weather_df.empty:
-            st.warning("날씨 데이터 없음 — 날씨 영향 분석 불가")
-        elif st.button("날씨 영향 AI 분석 실행", key="btn_weather"):
-            with st.spinner("날씨 영향 분석 중..."):
-                result = analyze_weather_impact(daily_df, weather_df, inflow_df=inflow_df)
-            st.markdown(result)
+        st.markdown(insights.get("weather_impact", "분석 결과가 없습니다."))
 
     # ── 구역 심층 분석 ───────────────────────────────────────────────────────
     with subtab_zone:
         st.subheader("구역별 심층 분석")
-        st.markdown(
-            "특정 날짜의 구역별 시간대 트래픽 이동 패턴, 구역 간 상관관계, "
-            "전기간 구역 시계열을 종합하여 분석합니다."
-        )
         zone_date = st.selectbox(
-            "분석할 날짜 선택",
+            "날짜 선택",
             options=all_dates,
             format_func=lambda d: make_date_label(d, weather_df),
             key="ai_zone_date",
         )
-        if st.button("구역 심층 AI 분석 실행", key="btn_zone"):
-            with st.spinner(f"{zone_date} 구역 분석 중..."):
-                result = analyze_zone_deep(
-                    zone_date, zone_df, hourly_ast_df, weather_df
-                )
+        zone_deep = insights.get("zone_deep", {})
+        result = zone_deep.get(zone_date)
+        if result:
             st.markdown(result)
+        else:
+            st.info(f"{zone_date} 구역 분석 결과가 없습니다.")
 
     # ── 체류시간 패턴 분석 ──────────────────────────────────────────────────
     with subtab_ast:
         st.subheader("누적 체류시간 패턴 분석")
-        st.markdown(
-            "방문 '질' 지표인 누적 체류시간을 분석합니다. "
-            "체류시간이 긴 날/시간대, iOS vs Android 차이, 날씨와 체류시간의 관계를 분석합니다."
-        )
-        if daily_ast_df is None or (hasattr(daily_ast_df, "empty") and daily_ast_df.empty):
-            st.warning("누적 체류시간 데이터가 없습니다. 캐시를 재빌드해주세요.")
-        elif st.button("체류시간 패턴 AI 분석 실행", key="btn_ast"):
-            with st.spinner("체류시간 패턴 분석 중..."):
-                result = analyze_ast_pattern(
-                    daily_ast_df, hourly_ast_df, weather_df, daily_df=daily_df
-                )
-            st.markdown(result)
+        st.markdown(insights.get("ast_pattern", "분석 결과가 없습니다."))
 
     st.markdown("---")
-    st.caption(
-        "AI 분석은 Claude Sonnet API를 사용합니다. "
-        "ANTHROPIC_API_KEY가 없으면 동작하지 않습니다."
-    )
+    st.caption("AI 분석은 사전 생성된 결과를 표시합니다. (claude-haiku-4-5, 2026-04-15 생성)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
