@@ -144,6 +144,113 @@ def _load_all() -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 캐시된 KPI 헬퍼 — 탭 전환 시 재계산 방지
+# ════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False)
+def _compute_overview_kpis(
+    daily_df: pd.DataFrame,
+    daily_ast_df: pd.DataFrame,
+) -> dict:
+    """개요 탭 KPI 전체를 한 번만 계산 후 캐시."""
+    festival_df = daily_df[daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
+    non_fest_df = daily_df[~daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
+
+    def _ratio(df: pd.DataFrame) -> tuple[float, float]:
+        if df.empty:
+            return 0.0, 0.0
+        ios_s = int(df["ios_udc"].sum())
+        and_s = int(df["android_udc"].sum())
+        tot   = ios_s + and_s
+        return (round(ios_s / tot * 100, 1), round(and_s / tot * 100, 1)) if tot else (0.0, 0.0)
+
+    peak_idx  = daily_df["udc"].idxmax()
+    peak_day  = daily_df.loc[peak_idx]
+    peak_ast_row = (daily_ast_df.loc[daily_ast_df["ast_hours"].idxmax()]
+                    if not daily_ast_df.empty else None)
+    return {
+        "avg_festival":       int(festival_df["udc"].mean()) if not festival_df.empty else 0,
+        "avg_non_fest":       int(non_fest_df["udc"].mean()) if not non_fest_df.empty else 0,
+        "total_udc":          int(daily_df["udc"].sum()),
+        "peak_day_date":      str(peak_day["date"]),
+        "peak_day_udc":       int(peak_day["udc"]),
+        "total_ast_h":        round(float(daily_ast_df["ast_hours"].sum()), 1) if not daily_ast_df.empty else 0.0,
+        "peak_ast_h":         round(float(peak_ast_row["ast_hours"]), 1) if peak_ast_row is not None else 0.0,
+        "peak_ast_date":      str(peak_ast_row["date"]) if peak_ast_row is not None else "",
+        "fest_ios_pct":       _ratio(festival_df)[0],
+        "fest_and_pct":       _ratio(festival_df)[1],
+        "non_fest_ios_pct":   _ratio(non_fest_df)[0],
+        "non_fest_and_pct":   _ratio(non_fest_df)[1],
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _compute_inflow_kpis(
+    fine_5min_df: pd.DataFrame,
+    selected_date: str,
+    resolution: int,
+) -> dict:
+    """유입/유출 탭 KPI — 날짜·해상도별 캐시."""
+    import numpy as np
+    sub = fine_5min_df[fine_5min_df["date"] == selected_date].sort_values("bin_5min")
+    if sub.empty:
+        return {}
+    bins_pw = resolution // 5
+    sub     = sub.copy()
+    sub["win"] = sub["bin_5min"] // bins_pw
+    agg   = sub.groupby("win")["corrected_dc"].mean()
+    delta = agg.diff().dropna()
+    return {
+        "peak_occ_val":  int(agg.max()),
+        "peak_occ_time": int(agg.idxmax()) * resolution,
+        "peak_in_val":   int(delta[delta > 0].max()) if (delta > 0).any() else 0,
+        "peak_in_time":  int(delta.idxmax()) * resolution if not delta.empty else 0,
+        "peak_out_val":  int(delta[delta < 0].min()) if (delta < 0).any() else 0,
+        "peak_out_time": int(delta.idxmin()) * resolution if not delta.empty else 0,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def _zone_dc_html(
+    sward_hourly_df: pd.DataFrame,
+    zone_df: pd.DataFrame,
+    map_date: str,
+    map_hour: int,
+    is_cumulative: bool,
+) -> str:
+    """구역별 DC 요약 HTML — 슬라이더 조작마다 재생성 방지."""
+    from config import ZONE_LABELS, ZONE_COLORS
+    if is_cumulative:
+        zh_raw = (
+            zone_df[(zone_df["date"] == map_date) & (zone_df["hour"] <= map_hour)]
+            .groupby("zone")["dc"].sum()
+            .reset_index()
+            .sort_values("dc", ascending=False)
+        )
+    else:
+        zh_raw = (
+            zone_df[(zone_df["date"] == map_date) & (zone_df["hour"] == map_hour)]
+            .sort_values("dc", ascending=False)
+        )
+    if zh_raw.empty:
+        return "<p style='color:#888;font-size:0.82rem;'>데이터 없음</p>"
+    # 벡터화: iterrows 제거 → 문자열 리스트 생성
+    rows_html = []
+    for zone, dc_v in zip(zh_raw["zone"], zh_raw["dc"]):
+        label = ZONE_LABELS.get(zone, zone)
+        color = ZONE_COLORS.get(zone, "#888888")
+        rows_html.append(
+            f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">'
+            f'<div style="width:10px;height:10px;border-radius:50%;'
+            f'background:{color};flex-shrink:0;"></div>'
+            f'<span style="font-size:0.82rem;">{label}</span>'
+            f'<span style="margin-left:auto;font-weight:600;'
+            f'font-size:0.85rem;">{int(dc_v):,}</span></div>'
+        )
+    return "\n".join(rows_html)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 사이드바
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -206,36 +313,19 @@ def render_overview(data: dict) -> None:
 
     st.header("개요")
 
-    # ── KPI 계산 ──────────────────────────────────────────────────────────────
-    festival_df   = daily_df[daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
-    non_fest_df   = daily_df[~daily_df["date"].between(FESTIVAL_START, FESTIVAL_END)]
-
-    avg_festival  = int(festival_df["udc"].mean()) if not festival_df.empty else 0
-    avg_non_fest  = int(non_fest_df["udc"].mean()) if not non_fest_df.empty else 0
-    total_udc     = int(daily_df["udc"].sum())
-    peak_day      = daily_df.loc[daily_df["udc"].idxmax()]
-    peak_label    = make_date_label(peak_day["date"], weather_df)
-
-    total_ast_h   = round(daily_ast_df["ast_hours"].sum(), 1) if not daily_ast_df.empty else 0.0
-    peak_ast_row  = (daily_ast_df.loc[daily_ast_df["ast_hours"].idxmax()]
-                     if not daily_ast_df.empty else None)
-    peak_ast_h    = round(float(peak_ast_row["ast_hours"]), 1) if peak_ast_row is not None else 0.0
-    peak_ast_lbl  = (make_date_label(str(peak_ast_row["date"]), weather_df)
-                     if peak_ast_row is not None else "")
-
-    # iOS/Android 비율 계산 (축제기간 / 비축제기간 분리)
-    def _ratio(df: pd.DataFrame) -> tuple[float, float]:
-        if df.empty:
-            return 0.0, 0.0
-        ios_s = int(df["ios_udc"].sum())
-        and_s = int(df["android_udc"].sum())
-        tot   = ios_s + and_s
-        if tot == 0:
-            return 0.0, 0.0
-        return round(ios_s / tot * 100, 1), round(and_s / tot * 100, 1)
-
-    fest_ios_pct,     fest_and_pct     = _ratio(festival_df)
-    non_fest_ios_pct, non_fest_and_pct = _ratio(non_fest_df)
+    # ── KPI 계산 (캐시된 헬퍼 — 탭 재진입 시 재계산 없음) ───────────────────────
+    kpi = _compute_overview_kpis(daily_df, daily_ast_df)
+    avg_festival      = kpi["avg_festival"]
+    avg_non_fest      = kpi["avg_non_fest"]
+    total_udc         = kpi["total_udc"]
+    peak_label        = make_date_label(kpi["peak_day_date"], weather_df)
+    total_ast_h       = kpi["total_ast_h"]
+    peak_ast_h        = kpi["peak_ast_h"]
+    peak_ast_lbl      = make_date_label(kpi["peak_ast_date"], weather_df) if kpi["peak_ast_date"] else ""
+    fest_ios_pct      = kpi["fest_ios_pct"]
+    fest_and_pct      = kpi["fest_and_pct"]
+    non_fest_ios_pct  = kpi["non_fest_ios_pct"]
+    non_fest_and_pct  = kpi["non_fest_and_pct"]
 
     # ── Row 1: 축제/비축제 일평균 DC, 전체 누적 체류시간, 피크일 누적 체류시간 ──
     c1, c2, c3, c4 = st.columns(4)
@@ -249,7 +339,7 @@ def render_overview(data: dict) -> None:
 
     # ── Row 2: 피크 일 DC, 전체 DC 합계 ─────────────────────────────────────
     c5, c6 = st.columns(2)
-    c5.metric("피크 일 DC", f"{int(peak_day['udc']):,}", delta=peak_label)
+    c5.metric("피크 일 DC", f"{kpi['peak_day_udc']:,}", delta=peak_label)
     c6.metric("전체 DC 합계", f"{total_udc:,}",
               help="전 기간 일별 Device Count 합산 (연인원 근사값)")
 
@@ -445,22 +535,15 @@ def render_inflow(data: dict) -> None:
             key="inflow_resolution",
         )
 
-    # ── KPI ────────────────────────────────────────────────────────────────
-    sub = fine_5min_df[fine_5min_df["date"] == selected_date].sort_values("bin_5min")
-    if not sub.empty:
-        import numpy as np
-        bins_pw    = resolution // 5
-        sub        = sub.copy()
-        sub["win"] = sub["bin_5min"] // bins_pw
-        agg        = sub.groupby("win")["corrected_dc"].mean()
-        delta      = agg.diff().dropna()
-
-        peak_occ_val  = int(agg.max())
-        peak_occ_time = int(agg.idxmax()) * resolution
-        peak_in_val   = int(delta[delta > 0].max()) if (delta > 0).any() else 0
-        peak_in_time  = int(delta.idxmax()) * resolution if not delta.empty else 0
-        peak_out_val  = int(delta[delta < 0].min()) if (delta < 0).any() else 0
-        peak_out_time = int(delta.idxmin()) * resolution if not delta.empty else 0
+    # ── KPI (캐시된 헬퍼 — 날짜/해상도 변경 시만 재계산) ─────────────────────
+    kpi = _compute_inflow_kpis(fine_5min_df, selected_date, resolution)
+    if kpi:
+        peak_occ_val  = kpi["peak_occ_val"]
+        peak_occ_time = kpi["peak_occ_time"]
+        peak_in_val   = kpi["peak_in_val"]
+        peak_in_time  = kpi["peak_in_time"]
+        peak_out_val  = kpi["peak_out_val"]
+        peak_out_time = kpi["peak_out_time"]
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("피크 Device Count",
@@ -573,42 +656,15 @@ def render_zone(data: dict) -> None:
             label_visibility="collapsed",
         )
 
-        # ── 해당 시간 구역별 DC 요약 ─────────────────────────────────────────
+        # ── 해당 시간 구역별 DC 요약 (캐시된 HTML 렌더링) ───────────────────────
         st.markdown("---")
         dc_label = f"00~{map_hour:02d}시 누적 DC" if is_cumulative else f"{map_hour:02d}시 구역별 DC"
         st.markdown(f"**{dc_label}**")
         if not sward_hourly_df.empty and not zone_df.empty:
-            from config import ZONE_LABELS, ZONE_COLORS
-            if is_cumulative:
-                zh_raw = zone_df[
-                    (zone_df["date"] == map_date) &
-                    (zone_df["hour"] <= map_hour)
-                ].groupby("zone")["dc"].sum().reset_index().sort_values("dc", ascending=False)
-            else:
-                zh_raw = zone_df[
-                    (zone_df["date"] == map_date) &
-                    (zone_df["hour"] == map_hour)
-                ].sort_values("dc", ascending=False)
-
-            if not zh_raw.empty:
-                for _, zrow in zh_raw.iterrows():
-                    zone  = zrow["zone"]
-                    label = ZONE_LABELS.get(zone, zone)
-                    color = ZONE_COLORS.get(zone, "#888888")
-                    dc_v  = int(zrow["dc"])
-                    st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:6px;'
-                        f'margin:3px 0;">'
-                        f'<div style="width:10px;height:10px;border-radius:50%;'
-                        f'background:{color};flex-shrink:0;"></div>'
-                        f'<span style="font-size:0.82rem;">{label}</span>'
-                        f'<span style="margin-left:auto;font-weight:600;'
-                        f'font-size:0.85rem;">{dc_v:,}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-            else:
-                st.caption("데이터 없음")
+            st.markdown(
+                _zone_dc_html(sward_hourly_df, zone_df, map_date, map_hour, is_cumulative),
+                unsafe_allow_html=True,
+            )
 
     # ── 좌측 지도 ─────────────────────────────────────────────────────────────
     with col_map:

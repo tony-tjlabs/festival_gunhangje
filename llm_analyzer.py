@@ -27,22 +27,24 @@ logger = logging.getLogger(__name__)
 # ── API 키 로드 ──────────────────────────────────────────────────────────────
 
 def _load_api_key() -> str | None:
-    # 1. 환경변수
+    # 1. 환경변수 (Streamlit Cloud secrets는 여기에 자동 주입됨)
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key:
         return key
-    # 2. .env 파일 (프로젝트 루트)
+    # 2. st.secrets (명시적 — Cloud에서 os.environ 주입 실패 시 대비)
+    try:
+        v = st.secrets["ANTHROPIC_API_KEY"]
+        if v:
+            return v
+    except Exception:
+        pass
+    # 3. .env 파일 (로컬 개발 전용)
     env_path = Path(__file__).parent / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
             line = line.strip()
             if line.startswith("ANTHROPIC_API_KEY="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
-    # 3. st.secrets (Streamlit Cloud)
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        pass
     return None
 
 
@@ -981,9 +983,10 @@ def _build_ast_pattern_context(
 # ── Claude API 호출 ──────────────────────────────────────────────────────────
 
 def _call_claude(system: str, user: str, max_tokens: int = 2000) -> str:
+    """Claude API 원본 호출 (캐시 없음 — 직접 호출 금지, _call_claude_cached 사용)."""
     api_key = _load_api_key()
     if not api_key:
-        return "ANTHROPIC_API_KEY가 설정되지 않았습니다. .env 파일에 키를 추가해주세요."
+        return "ANTHROPIC_API_KEY가 설정되지 않았습니다. Streamlit Cloud Secrets에 키를 추가해주세요."
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
@@ -996,7 +999,13 @@ def _call_claude(system: str, user: str, max_tokens: int = 2000) -> str:
         return msg.content[0].text
     except Exception as e:
         logger.error("Claude API 오류: %s", e)
-        return f"AI 분석 오류: {e}"
+        return "AI 분석 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def _call_claude_cached(system: str, user: str, max_tokens: int = 2000) -> str:
+    """Claude API 캐시 래퍼 — 동일 프롬프트 1시간 내 재클릭 시 즉시 반환."""
+    return _call_claude(system, user, max_tokens)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1033,7 +1042,7 @@ def analyze_single_day(
 6. **운영 인사이트**: 혼잡 관리 및 방문객 경험 개선을 위한 구체적 제언 2가지
 
 각 항목은 데이터 수치를 근거로 2~4문장으로 작성해주세요."""
-    return _call_claude(SYSTEM_PROMPT, prompt, max_tokens=2000)
+    return _call_claude_cached(SYSTEM_PROMPT, prompt, max_tokens=2000)
 
 
 def analyze_full_period(
@@ -1067,7 +1076,7 @@ def analyze_full_period(
 10. **운영 개선 제언**: 내년 축제를 위한 실질적 제언 3가지
 
 전문적이지만 이해하기 쉽게, 구체적 수치와 함께 작성해주세요."""
-    return _call_claude(SYSTEM_PROMPT, prompt, max_tokens=2500)
+    return _call_claude_cached(SYSTEM_PROMPT, prompt, max_tokens=2500)
 
 
 def analyze_weather_impact(
@@ -1091,7 +1100,7 @@ def analyze_weather_impact(
 6. **종합 평가**: 이번 군항제에서 날씨가 방문객 수에 미친 영향의 크기와 방향
 
 데이터에 근거하여 구체적 수치와 함께 작성해주세요."""
-    return _call_claude(SYSTEM_PROMPT, prompt, max_tokens=2000)
+    return _call_claude_cached(SYSTEM_PROMPT, prompt, max_tokens=2000)
 
 
 def analyze_zone_deep(
@@ -1114,7 +1123,7 @@ def analyze_zone_deep(
 6. **운영 제언**: 구역별 안내·동선·자원 배치 최적화 방안
 
 수치를 근거로 구체적으로 작성해주세요."""
-    return _call_claude(SYSTEM_PROMPT, prompt, max_tokens=2000)
+    return _call_claude_cached(SYSTEM_PROMPT, prompt, max_tokens=2000)
 
 
 def analyze_ast_pattern(
@@ -1139,4 +1148,4 @@ def analyze_ast_pattern(
 6. **방문 경험 개선**: AST 분석을 바탕으로 방문자 체류를 늘리기 위한 운영 제언
 
 구체적 수치와 함께 한국어로 작성해주세요."""
-    return _call_claude(SYSTEM_PROMPT, prompt, max_tokens=2000)
+    return _call_claude_cached(SYSTEM_PROMPT, prompt, max_tokens=2000)

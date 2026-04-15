@@ -10,13 +10,27 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-
 from pathlib import Path
+
+import PIL.Image
+from scipy.ndimage import gaussian_filter
+import streamlit as st
 
 from config import (
     ALL_ZONES, DOW_KO, FESTIVAL_END, FESTIVAL_START,
     SWARD_TO_ZONE, ZONE_COLORS, ZONE_LABELS, WEATHER_COLORS, WEEKEND_DAYS,
 )
+
+
+# ── Ground.png 캐시 (앱 생명주기 1회만 로드) ─────────────────────────────────
+
+@st.cache_resource
+def _load_ground_image(img_path_str: str) -> "PIL.Image.Image | None":
+    """Ground.png를 한 번만 로드해 메모리에 유지."""
+    p = Path(img_path_str)
+    if p.exists():
+        return PIL.Image.open(p).copy()   # copy() → 파일 핸들 즉시 해제
+    return None
 
 # ── 공통 테마 ────────────────────────────────────────────────────────────────
 
@@ -728,10 +742,9 @@ def chart_zone_map(swards_df: pd.DataFrame, zone_hourly_df: pd.DataFrame, select
 
     fig = go.Figure()
 
-    # Ground.png 배경 (존재 시)
-    if img_path.exists():
-        import PIL.Image
-        img = PIL.Image.open(img_path)
+    # Ground.png 배경 (캐시된 인스턴스)
+    img = _load_ground_image(str(img_path))
+    if img is not None:
         w, h = img.size
         fig.add_layout_image(dict(
             source   = img,
@@ -819,10 +832,9 @@ def chart_zone_map_with_slider(
 
     fig = go.Figure()
 
-    # Ground.png 배경
-    if img_path.exists():
-        import PIL.Image
-        img = PIL.Image.open(img_path)
+    # Ground.png 배경 (캐시된 인스턴스)
+    img = _load_ground_image(str(img_path))
+    if img is not None:
         fig.add_layout_image(dict(
             source   = img,
             xref     = "x", yref = "y",
@@ -1211,9 +1223,6 @@ def chart_sward_heatmap_slider(
     cumulative=False : 선택 시간대 단독 DC (혼잡도)
     cumulative=True  : 0시 ~ 선택 시간까지 DC 합산 (누적 방문 강도)
     """
-    from scipy.ndimage import gaussian_filter
-    import PIL.Image
-
     IMG_W, IMG_H = 3319, 6599
     SCALE = 0.25
 
@@ -1234,9 +1243,9 @@ def chart_sward_heatmap_slider(
 
     fig = go.Figure()
 
-    # ── 배경 이미지 (어둡게 — 히트맵 대비 강조) ──────────────────────────────
-    if img_path.exists():
-        bg_img = PIL.Image.open(img_path)
+    # ── 배경 이미지 (캐시된 인스턴스 사용 — 디스크 I/O 제거) ───────────────────
+    bg_img = _load_ground_image(str(img_path))
+    if bg_img is not None:
         fig.add_layout_image(dict(
             source=bg_img, xref="x", yref="y",
             x=0, y=0, sizex=IMG_W, sizey=IMG_H,
@@ -1262,11 +1271,10 @@ def chart_sward_heatmap_slider(
             h = max(1, int(IMG_H * SCALE))
             intensity = np.zeros((h, w), dtype=np.float32)
 
-            # ── raw DC값으로 intensity 구성 ──────────────────────────────────
-            for _, row in active.iterrows():
-                px = int(np.clip(row["x"] * SCALE, 0, w - 1))
-                py = int(np.clip(row["y"] * SCALE, 0, h - 1))
-                intensity[py, px] += float(row["dc"])
+            # ── raw DC값으로 intensity 구성 (벡터화 — iterrows 제거) ───────────
+            px_arr = np.clip((active["x"].values * SCALE).astype(int), 0, w - 1)
+            py_arr = np.clip((active["y"].values * SCALE).astype(int), 0, h - 1)
+            np.add.at(intensity, (py_arr, px_arr), active["dc"].values.astype(np.float32))
 
             # ── 모드별 global_max 계산 (날짜가 달라도 동일 기준) ─────────────────
             if cumulative:
@@ -1331,7 +1339,7 @@ def chart_sward_heatmap_slider(
             glow = _blur_and_scale(intensity, sigma_px=130 * SCALE)
             rgba_glow = _heat_rgba(glow, alpha_boost=0.72)
             pil_glow  = PIL.Image.fromarray(rgba_glow, "RGBA")
-            pil_glow  = pil_glow.resize((IMG_W, IMG_H), PIL.Image.LANCZOS)
+            pil_glow  = pil_glow.resize((IMG_W, IMG_H), PIL.Image.BILINEAR)
             fig.add_layout_image(dict(
                 source=pil_glow, xref="x", yref="y",
                 x=0, y=0, sizex=IMG_W, sizey=IMG_H,
@@ -1342,7 +1350,7 @@ def chart_sward_heatmap_slider(
             core = _blur_and_scale(intensity, sigma_px=48 * SCALE)
             rgba_core = _heat_rgba(core, alpha_boost=1.0)
             pil_core  = PIL.Image.fromarray(rgba_core, "RGBA")
-            pil_core  = pil_core.resize((IMG_W, IMG_H), PIL.Image.LANCZOS)
+            pil_core  = pil_core.resize((IMG_W, IMG_H), PIL.Image.BILINEAR)
             fig.add_layout_image(dict(
                 source=pil_core, xref="x", yref="y",
                 x=0, y=0, sizex=IMG_W, sizey=IMG_H,
@@ -1459,13 +1467,16 @@ def chart_flow_sankey(
     if zone_flow.empty:
         return _empty_fig(f"{date_str} {hour:02d}시 — 구역 간 이동 (데이터 없음)")
 
-    zone_idx   = {z: i for i, z in enumerate(ZONES)}
-    sources    = [zone_idx[r["from_zone"]] for _, r in zone_flow.iterrows()
-                  if r["from_zone"] in zone_idx and r["to_zone"] in zone_idx]
-    targets    = [zone_idx[r["to_zone"]]   for _, r in zone_flow.iterrows()
-                  if r["from_zone"] in zone_idx and r["to_zone"] in zone_idx]
-    values_cnt = [int(r["count"])           for _, r in zone_flow.iterrows()
-                  if r["from_zone"] in zone_idx and r["to_zone"] in zone_idx]
+    zone_idx = {z: i for i, z in enumerate(ZONES)}
+    # 벡터화: 3중 iterrows 제거 → 단일 mask 필터
+    valid_mask = (
+        zone_flow["from_zone"].isin(zone_idx) &
+        zone_flow["to_zone"].isin(zone_idx)
+    )
+    vf         = zone_flow[valid_mask]
+    sources    = vf["from_zone"].map(zone_idx).tolist()
+    targets    = vf["to_zone"].map(zone_idx).tolist()
+    values_cnt = vf["count"].astype(int).tolist()
 
     if not sources:
         return _empty_fig(f"{date_str} {hour:02d}시 — 구역 간 이동 (데이터 없음)")
@@ -1523,8 +1534,8 @@ def chart_flow_zone_map(
     ARROW_COLORS = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
 
     fig = go.Figure()
-    if img_path.exists():
-        bg = PIL.Image.open(img_path)
+    bg = _load_ground_image(str(img_path))
+    if bg is not None:
         fig.add_layout_image(dict(
             source=bg, xref="x", yref="y",
             x=0, y=0, sizex=IMG_W, sizey=IMG_H,
@@ -1646,8 +1657,8 @@ def chart_flow_arrows(
 
     # ── 배경 설정 ──────────────────────────────────────────────────────────────
     fig = go.Figure()
-    if img_path.exists():
-        bg = PIL.Image.open(img_path)
+    bg = _load_ground_image(str(img_path))
+    if bg is not None:
         fig.add_layout_image(dict(
             source=bg, xref="x", yref="y",
             x=0, y=0, sizex=IMG_W, sizey=IMG_H,
