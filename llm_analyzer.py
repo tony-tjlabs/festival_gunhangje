@@ -316,7 +316,7 @@ def _build_daily_context(
         cum_in  = row_io["inflow"].cumsum()
         cum_out = row_io["outflow"].cumsum()
         occupancy = cum_in - cum_out
-        peak_occ_h = int(row_io.iloc[occupancy.idxmax()]["hour"])
+        peak_occ_h = int(row_io.loc[occupancy.idxmax(), "hour"])
         peak_occ   = int(occupancy.max())
 
         parts.append("\n### 유입/유출 패턴")

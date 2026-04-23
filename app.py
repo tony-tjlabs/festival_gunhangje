@@ -29,6 +29,9 @@ from config import (
     DOW_KO, FESTIVAL_END, FESTIVAL_START,
     ZONE_LABELS,
 )
+from preprocessor import (
+    build_cache, cache_exists, cache_info, discover_dates, load_cache,
+)
 from weather import fetch_weather, make_date_label
 from charts import (
     # 탭 1
@@ -47,9 +50,24 @@ from charts import (
     chart_zone_map, chart_zone_map_with_slider, chart_sward_heatmap_slider,
     # 탭 5 (동선)
     chart_flow_sankey, chart_flow_zone_map, chart_flow_sward_map,
-    # 탭 5
+    # 탭 6
     chart_weather_scatter_temp, chart_weather_scatter_precip, chart_weather_hourly_pattern,
+    # 탭 8 — 이동성
+    chart_mobility_map, chart_mobility_hourly, chart_speed_distribution,
+    # 탭 9 — 구역 체류시간
+    chart_zone_dwell_bar, chart_zone_dwell_box, chart_zone_dwell_heatmap,
+    # 탭 9 — 누적 체류시간
+    chart_cumulative_daily, chart_cumulative_hourly, chart_cumulative_30min,
+    # 공통 — 구역 위치 안내
+    chart_zone_highlight,
 )
+from movement_analyzer import (
+    compute_and_cache, cache_exists as movement_cache_exists,
+    load_mobility_cache, load_dwell_cache, load_mac_mobility_cache,
+    load_zone_cumulative_cache,
+    aggregate_mobility, aggregate_dwell,
+)
+from config import ZONE_COLORS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -70,23 +88,6 @@ st.markdown("""
 div[data-testid="stSidebarContent"] h2 { color: #e5604a; }
 </style>
 """, unsafe_allow_html=True)
-
-# ── 비밀번호 인증 ─────────────────────────────────────────────────────────────
-_APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.title(APP_ICON + " " + APP_TITLE)
-    pw = st.text_input("비밀번호를 입력하세요", type="password", key="pw_input")
-    if pw:
-        if pw == _APP_PASSWORD:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("비밀번호가 올바르지 않습니다.")
-    st.stop()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -109,31 +110,23 @@ def _load_swards() -> pd.DataFrame:
 # 데이터 로드
 # ════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(show_spinner=False)
 def _load_all() -> dict:
-    """캐시 parquet 직접 로드 + 날씨 데이터 포함 통합 dict 반환."""
-    from config import (
-        CACHE_DAILY, CACHE_HOURLY, CACHE_ZONE_HOURLY, CACHE_INFLOW,
-        CACHE_FINE_5MIN, CACHE_DAILY_AST, CACHE_HOURLY_AST,
-        CACHE_SWARD_HOURLY, CACHE_FLOW,
-    )
-    cache_dir = BASE_DIR / "cache"
-    data = {
-        "daily":        pd.read_parquet(cache_dir / CACHE_DAILY),
-        "hourly":       pd.read_parquet(cache_dir / CACHE_HOURLY),
-        "zone_hourly":  pd.read_parquet(cache_dir / CACHE_ZONE_HOURLY),
-        "inflow":       pd.read_parquet(cache_dir / CACHE_INFLOW),
-        "fine_5min":    pd.read_parquet(cache_dir / CACHE_FINE_5MIN),
-        "daily_ast":    pd.read_parquet(cache_dir / CACHE_DAILY_AST),
-        "hourly_ast":   pd.read_parquet(cache_dir / CACHE_HOURLY_AST),
-        "sward_hourly": pd.read_parquet(cache_dir / CACHE_SWARD_HOURLY),
-        "flow":         pd.read_parquet(cache_dir / CACHE_FLOW),
-    }
+    """캐시 로드 + 날씨 데이터 포함 통합 dict 반환.
+
+    일별/시간별 Device Count는 raw 값 그대로 사용 (연인원 근사, 요일 비교용).
+    Device Count는 daily_df의 udc(일별 unique MAC 수)를 그대로 사용.
+    """
+    data = load_cache(BASE_DIR)
     daily_df = data["daily"]
+
+    # ── 날씨 데이터 ──────────────────────────────────────────────────────────
     if not daily_df.empty:
-        weather_df = fetch_weather(daily_df["date"].min(), daily_df["date"].max())
+        start = daily_df["date"].min()
+        end   = daily_df["date"].max()
+        weather_df = fetch_weather(start, end)
     else:
         weather_df = pd.DataFrame()
+
     data["weather"] = weather_df
     return data
 
@@ -156,9 +149,46 @@ def render_sidebar() -> dict | None:
 """)
         st.markdown("---")
 
+        # 캐시 상태
+        st.markdown("### 캐시 상태")
+        if cache_exists(BASE_DIR):
+            info = cache_info(BASE_DIR)
+            for key, meta in info.items():
+                st.markdown(f"- **{key}**: {meta['size_mb']} MB `{meta['mtime']}`")
+            st.success("캐시 정상")
+
+            if st.button("캐시 재빌드", help="raw CSV 재처리"):
+                progress_bar = st.progress(0.0, text="준비 중...")
+                def _cb(ratio: float, msg: str) -> None:
+                    progress_bar.progress(ratio, text=msg)
+                ok = build_cache(BASE_DIR, progress_callback=_cb)
+                if ok:
+                    st.success("재빌드 완료 — 새로고침 필요")
+                    st.cache_data.clear()
+                else:
+                    st.error("재빌드 실패 — 로그 확인")
+        else:
+            st.warning("캐시 없음")
+            dates = discover_dates(BASE_DIR)
+            st.markdown(f"발견된 CSV: {len(dates)}개")
+            if st.button("캐시 빌드"):
+                progress_bar = st.progress(0.0, text="준비 중...")
+                def _cb(ratio: float, msg: str) -> None:
+                    progress_bar.progress(ratio, text=msg)
+                ok = build_cache(BASE_DIR, progress_callback=_cb)
+                if ok:
+                    st.success("빌드 완료")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error("빌드 실패")
+            return None
+
         st.markdown("---")
         st.caption("TJLABS · Festival Analytics v1.0")
 
+    if not cache_exists(BASE_DIR):
+        return None
     return _load_all()
 
 
@@ -887,16 +917,11 @@ def render_weather(data: dict) -> None:
 @st.cache_data(show_spinner=False)
 def _load_ai_insights() -> dict:
     """사전 생성된 ai_insights.json 로드."""
-    import json, re
     p = BASE_DIR / "cache" / "ai_insights.json"
-    if not p.exists():
-        return {}
-    raw = p.read_text(encoding="utf-8")
-    # 테이블 셀 단독 '-' → '─' (마크다운 separator row 오인 방지)
-    raw = re.sub(r'\| - \|', '| ─ |', raw)
-    # 수학 마이너스(U+2212) → 하이픈으로 정규화
-    raw = raw.replace('\u2212', '-')
-    return json.loads(raw)
+    if p.exists():
+        import json
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}
 
 
 def render_ai(data: dict) -> None:
@@ -911,8 +936,8 @@ def render_ai(data: dict) -> None:
         st.warning("AI 인사이트 파일을 찾을 수 없습니다. (cache/ai_insights.json)")
         return
 
-    subtab_period, subtab_single, subtab_weather, subtab_zone = st.tabs(
-        ["전체기간 종합", "단일 날짜 분석", "날씨 영향 분석", "구역 심층 분석"]
+    subtab_period, subtab_single, subtab_weather, subtab_zone, subtab_ast = st.tabs(
+        ["전체기간 종합", "단일 날짜 분석", "날씨 영향 분석", "구역 심층 분석", "체류시간 패턴"]
     )
 
     # ── 전체기간 종합 ────────────────────────────────────────────────────────
@@ -957,8 +982,262 @@ def render_ai(data: dict) -> None:
         else:
             st.info(f"{zone_date} 구역 분석 결과가 없습니다.")
 
+    # ── 체류시간 패턴 분석 ──────────────────────────────────────────────────
+    with subtab_ast:
+        st.subheader("누적 체류시간 패턴 분석")
+        st.markdown(insights.get("ast_pattern", "분석 결과가 없습니다."))
+
     st.markdown("---")
     st.caption("AI 분석은 사전 생성된 결과를 표시합니다. (claude-haiku-4-5, 2026-04-15 생성)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 탭 8 — 이동 속도 (RSSI 변화율 기반)
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_movement(data: dict) -> None:
+    daily_df  = data["daily"]
+    all_dates = sorted(daily_df["date"].unique().tolist())
+    swards_df = _load_swards()
+
+    st.header("이동 속도 분석")
+
+    # ── 캐시 로드 ────────────────────────────────────────────────────────────
+    sel_date = st.selectbox(
+        "날짜 선택",
+        options=["전체 기간"] + all_dates,
+        key="mv_date",
+    )
+    targets = all_dates if sel_date == "전체 기간" else [sel_date]
+    frames  = [load_mobility_cache(BASE_DIR, d) for d in targets]
+    frames  = [f for f in frames if not f.empty]
+
+    if not frames:
+        st.info("데이터를 준비 중입니다. `generate_movement_cache.py`를 먼저 실행해주세요.")
+        return
+
+    mobility_df = aggregate_mobility(frames)
+
+    # MAC 레벨 이동성 캐시 (속도 분포용)
+    mac_frames = [load_mac_mobility_cache(BASE_DIR, d) for d in targets]
+    mac_frames = [f for f in mac_frames if not f.empty]
+    mac_mobility_df = pd.concat(mac_frames, ignore_index=True) if mac_frames else pd.DataFrame()
+
+    # ── 하단 섹션: 구역별 이동 속도 분포 ────────────────────────────────────
+    st.markdown("---")
+    st.subheader("구역별 추정 보행속도 분포")
+    st.caption(
+        "RSSI 이동성 지수를 군항제 축제 환경 기준으로 보행속도(km/h)로 환산합니다.  \n"
+        "피크 시간에는 극혼잡(0.1~0.5 km/h)에 가까울 것으로 예측됩니다.  \n"
+        "※ BLE 신호 기반 추정값이며 실제 속도와 차이가 있을 수 있습니다."
+    )
+
+    from config import ALL_ZONES, ZONE_LABELS, SWARD_TO_ZONE
+
+    ctrl_a, ctrl_b = st.columns(2)
+    with ctrl_a:
+        sel_zone = st.selectbox(
+            "구역 선택",
+            options=ALL_ZONES,
+            format_func=lambda z: ZONE_LABELS.get(z, z),
+            key="mv_speed_zone",
+        )
+    with ctrl_b:
+        sel_speed_hour = st.select_slider(
+            "시간 선택",
+            options=list(range(24)),
+            value=12,
+            format_func=lambda h: f"{h:02d}시",
+            key="mv_speed_hour",
+        )
+
+    # ── KPI: 해당 구역·시간 MAC 기반 속도 ───────────────────────────────────
+    from movement_analyzer import _speed_level as _slvl
+    from charts import _rssi_range_to_speed as _r2spd
+
+    if not mac_mobility_df.empty:
+        mac_filtered = mac_mobility_df[
+            (mac_mobility_df["hour"] == sel_speed_hour) &
+            (mac_mobility_df["zone"] == sel_zone)
+        ]
+    else:
+        mac_filtered = pd.DataFrame()
+
+    if not mac_filtered.empty:
+        col    = "rssi_range_mean" if "rssi_range_mean" in mac_filtered.columns else "rssi_std_mean"
+        speeds = mac_filtered[col].apply(_r2spd)
+        mean_speed = float(speeds.mean())
+        min_speed  = float(speeds.min())
+        max_speed  = float(speeds.max())
+        n_mac      = len(mac_filtered)
+        level_name, _ = _slvl(mean_speed)
+
+        kc1, kc2, kc3, kc4 = st.columns(4)
+        kc1.metric("평균 추정 속도", f"{mean_speed:.2f} km/h")
+        kc2.metric("최저 속도", f"{min_speed:.2f} km/h")
+        kc3.metric("최고 속도", f"{max_speed:.2f} km/h")
+        kc4.metric("혼잡 수준", f"{level_name} ({n_mac:,}명)")
+
+        st.plotly_chart(
+            chart_speed_distribution(mac_mobility_df, sel_zone, sel_speed_hour),
+            use_container_width=True,
+        )
+    else:
+        st.info(f"{ZONE_LABELS.get(sel_zone, sel_zone)} — {sel_speed_hour:02d}시 MAC 데이터가 없습니다. 캐시를 재생성해 주세요.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 탭 9 — 구역 체류시간
+# ════════════════════════════════════════════════════════════════════════════
+
+def render_zone_dwell(data: dict) -> None:
+    daily_df   = data["daily"]
+    weather_df = data["weather"]
+    all_dates  = sorted(daily_df["date"].unique().tolist())
+
+    st.header("체류시간 분석")
+
+    from config import ZONE_LABELS, ALL_ZONES
+
+    # 날짜 선택
+    sel_date = st.selectbox(
+        "날짜 선택",
+        options=["전체 기간"] + all_dates,
+        key="dw_date",
+    )
+    targets = all_dates if sel_date == "전체 기간" else [sel_date]
+
+    # ── 누적 체류시간 캐시 로드 ───────────────────────────────────────────────
+    cum_frames = [load_zone_cumulative_cache(BASE_DIR, d) for d in targets]
+    cum_frames = [f for f in cum_frames if not f.empty]
+    cum_df = pd.concat(cum_frames, ignore_index=True) if cum_frames else pd.DataFrame()
+
+    # ── 평균 체류시간 캐시 로드 ───────────────────────────────────────────────
+    dwell_frames = [load_dwell_cache(BASE_DIR, d) for d in targets]
+    dwell_frames = [f for f in dwell_frames if not f.empty]
+    dwell_df = aggregate_dwell(dwell_frames)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 1: 누적 체류시간
+    # ════════════════════════════════════════════════════════════════════════
+    st.subheader("누적 체류시간")
+    st.caption(
+        "각 시간대에 구역 내 존재한 기기 수 × 시간 = 총 이용량(person-hours).  \n"
+        "예: 5명이 1분간 체류 → 5 person-min = 1/12 person-hour.  \n"
+        "※ 시간 해상도: 하루 누적 / 1시간 / 30분 (30분 해상도는 해당 구간 내 누적값 — 전 구간 독립)"
+    )
+
+    if cum_df.empty:
+        st.info("누적 체류시간 데이터를 준비 중입니다. `generate_movement_cache.py`를 먼저 실행해주세요.")
+    else:
+        # 시간해상도 선택
+        res = st.radio(
+            "시간 해상도",
+            options=["하루 누적", "1시간", "30분"],
+            horizontal=True,
+            key="dw_resolution",
+        )
+
+        if res == "하루 누적":
+            # KPI: 구역별 총 person-hours
+            daily_agg = cum_df.groupby("zone")["mac_count"].sum().reset_index()
+            daily_agg["person_hour"] = (daily_agg["mac_count"] / 60).round(1)
+            cols = st.columns(len(daily_agg))
+            for col, (_, row) in zip(cols, daily_agg.sort_values("zone").iterrows()):
+                col.metric(ZONE_LABELS.get(row["zone"], row["zone"]), f"{row['person_hour']:,.0f} ph")
+            st.plotly_chart(chart_cumulative_daily(cum_df, ZONE_LABELS), use_container_width=True)
+
+        elif res == "1시간":
+            st.plotly_chart(chart_cumulative_hourly(cum_df, ZONE_LABELS), use_container_width=True)
+
+        else:  # 30분
+            z_col, map_col = st.columns([2, 1])
+            with z_col:
+                sel_zone_cum = st.selectbox(
+                    "구역 선택",
+                    options=ALL_ZONES,
+                    format_func=lambda z: ZONE_LABELS.get(z, z),
+                    key="dw_cum_zone",
+                )
+            with map_col:
+                show_map_cum = st.toggle("구역 위치 보기", key="dw_cum_map_toggle")
+
+            if show_map_cum:
+                swards_df = _load_swards()
+                st.plotly_chart(
+                    chart_zone_highlight(swards_df, sel_zone_cum),
+                    use_container_width=True,
+                )
+            st.plotly_chart(
+                chart_cumulative_30min(cum_df, sel_zone_cum, ZONE_LABELS),
+                use_container_width=True,
+            )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 2: 평균 체류시간 (기존 분석)
+    # ════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("개인별 평균 체류시간")
+    st.caption(
+        "MAC별 지배 S-Ward를 추적하여 A~E 구역에서 **실제 머문 시간**을 계산합니다.  \n"
+        "※ MAC 랜덤화(iOS ~15분, Android ~5분) 특성상 2분~2시간 범위 세션만 집계합니다."
+    )
+
+    if dwell_df.empty:
+        st.info("체류시간 데이터를 준비 중입니다.")
+        return
+
+    # 날짜/구역 필터
+    dw_col_a, dw_col_b, dw_col_c = st.columns([2, 2, 1])
+    with dw_col_a:
+        dw_zone = st.selectbox(
+            "구역 선택",
+            options=["전체"] + ALL_ZONES,
+            format_func=lambda z: "전체" if z == "전체" else ZONE_LABELS.get(z, z),
+            key="dw_zone",
+        )
+    with dw_col_b:
+        dw_hour = st.selectbox(
+            "시간대 필터",
+            options=["전체"] + [f"{h:02d}시" for h in range(24)],
+            key="dw_hour",
+        )
+    with dw_col_c:
+        show_map_avg = st.toggle("구역 위치 보기", key="dw_avg_map_toggle")
+
+    if show_map_avg:
+        swards_df = _load_swards()
+        hl_zone = dw_zone if dw_zone != "전체" else None
+        st.plotly_chart(
+            chart_zone_highlight(swards_df, hl_zone),
+            use_container_width=True,
+        )
+
+    filt = dwell_df.copy()
+    if dw_zone != "전체":
+        filt = filt[filt["zone"] == dw_zone]
+    if dw_hour != "전체":
+        h = int(dw_hour[:2])
+        filt = filt[filt["hour_start"] == h]
+
+    if filt.empty:
+        st.info("선택한 조건에 데이터가 없습니다.")
+        return
+
+    # KPI
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("총 세션", f"{len(filt):,}건")
+    k2.metric("평균 체류", f"{filt['dwell_s'].mean()/60:.1f}분")
+    k3.metric("중앙값", f"{filt['dwell_s'].median()/60:.1f}분")
+    k4.metric("최장 체류", f"{filt['dwell_s'].max()/60:.0f}분")
+
+    dw_c1, dw_c2 = st.columns(2)
+    with dw_c1:
+        st.plotly_chart(chart_zone_dwell_bar(filt, ZONE_COLORS), use_container_width=True)
+    with dw_c2:
+        st.plotly_chart(chart_zone_dwell_box(filt, ZONE_COLORS), use_container_width=True)
+
+    st.plotly_chart(chart_zone_dwell_heatmap(dwell_df, ZONE_COLORS), use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -968,8 +1247,18 @@ def render_ai(data: dict) -> None:
 def main() -> None:
     data = render_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "개요", "시간대 분석", "유입/유출", "구역별 분석", "동선 분석", "날씨 영향", "AI 인사이트",
+    if data is None:
+        st.title(APP_ICON + " " + APP_TITLE)
+        st.info(
+            "사이드바에서 캐시를 빌드하거나, "
+            "이미 캐시가 있다면 새로고침 후 분석을 시작하세요."
+        )
+        return
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "개요", "시간대 분석", "유입/유출", "구역별 분석",
+        "동선 분석", "날씨 영향", "AI 인사이트",
+        "🏃 이동 속도", "🕐 구역 체류시간",
     ])
 
     with tab1:
@@ -986,6 +1275,10 @@ def main() -> None:
         render_weather(data)
     with tab7:
         render_ai(data)
+    with tab8:
+        render_movement(data)
+    with tab9:
+        render_zone_dwell(data)
 
 
 if __name__ == "__main__":

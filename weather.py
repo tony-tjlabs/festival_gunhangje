@@ -24,13 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 def _ssl_ctx() -> ssl.SSLContext:
-    """SSL 컨텍스트 생성 — certifi 우선, 없으면 시스템 기본값 (CERT_NONE 금지)."""
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except ImportError:
-        # certifi 미설치 시 시스템 기본 CA 사용 (검증 비활성화 절대 금지)
-        return ssl.create_default_context()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
 
 
 @st.cache_data(show_spinner=False, ttl=86_400)

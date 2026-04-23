@@ -2029,3 +2029,729 @@ def chart_flow_sward_map(
         )
     )
     return fig
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 이동성 지수 지도 (RSSI 변화율 기반)
+# ════════════════════════════════════════════════════════════════════════════
+
+def chart_mobility_map(
+    mobility_df: pd.DataFrame,
+    swards_df: pd.DataFrame,
+    base_dir: Path,
+    selected_hour: int | None = None,
+) -> go.Figure:
+    """
+    S-Ward별 이동성 지수를 Gaussian blur 히트맵으로 Ground.png 위에 표시.
+    탭 4의 chart_sward_heatmap_slider와 동일한 렌더링 방식.
+
+    파랑(정지) → 청록 → 노랑 → 주황 → 빨강(활발 이동) 컬러맵.
+    """
+    IMG_W, IMG_H = 3319, 6599
+    SCALE = 0.25
+    img_path = base_dir / "Data" / "Ground.png"
+
+    # ── 시간 필터 & sward별 집계 ─────────────────────────────────────────────
+    mdf = mobility_df[mobility_df["hour"] == selected_hour] if selected_hour is not None else mobility_df.copy()
+
+    if mdf.empty:
+        agg = pd.DataFrame(columns=["sward", "avg_mobility", "mac_count"])
+    else:
+        agg = (
+            mdf.groupby("sward")
+            .apply(lambda g: pd.Series({
+                "avg_mobility": (
+                    np.average(g["avg_mobility"], weights=g["mac_count"])
+                    if g["mac_count"].sum() > 0 else 0.0
+                ),
+                "mac_count": g["mac_count"].sum(),
+            }))
+            .reset_index()
+        )
+
+    # sward 좌표 merge
+    valid_sw = swards_df[(swards_df["x"] > 0) & (swards_df["y"] > 0)].copy()
+    valid_sw["name"] = valid_sw["name"].astype(str)
+    agg["sward"] = agg["sward"].astype(str)
+    plot_df = valid_sw.merge(agg, left_on="name", right_on="sward", how="left")
+    plot_df["avg_mobility"] = plot_df["avg_mobility"].fillna(0.0)
+    plot_df["mac_count"]    = plot_df["mac_count"].fillna(0).astype(int)
+    active = plot_df[plot_df["avg_mobility"] > 0]
+
+    fig = go.Figure()
+
+    # ── 배경 이미지 ───────────────────────────────────────────────────────────
+    bg_img = _load_ground_image(str(img_path))
+    if bg_img is not None:
+        fig.add_layout_image(dict(
+            source=bg_img, xref="x", yref="y",
+            x=0, y=0, sizex=IMG_W, sizey=IMG_H,
+            sizing="stretch", opacity=0.18, layer="below",
+        ))
+    fig.update_xaxes(range=[0, IMG_W], showgrid=False, zeroline=False, visible=False)
+    fig.update_yaxes(range=[IMG_H, 0], showgrid=False, zeroline=False,
+                     visible=False, scaleanchor="x", scaleratio=1)
+
+    # ── Gaussian blur 히트맵 ──────────────────────────────────────────────────
+    if not active.empty:
+        w = max(1, int(IMG_W * SCALE))
+        h = max(1, int(IMG_H * SCALE))
+        intensity = np.zeros((h, w), dtype=np.float32)
+
+        px_arr = np.clip((active["x"].values * SCALE).astype(int), 0, w - 1)
+        py_arr = np.clip((active["y"].values * SCALE).astype(int), 0, h - 1)
+        # intensity = avg_mobility 값 (0~100)
+        np.add.at(intensity, (py_arr, px_arr), active["avg_mobility"].values.astype(np.float32))
+
+        # 현재 시간대 이동성 최대값 기반 scale (전체 0~100 대비)
+        cur_max  = float(active["avg_mobility"].max()) or 1.0
+        scale    = float(np.clip(cur_max / 100.0, 0.0, 1.0))
+
+        # 이동성 전용 컬러맵: 파랑(정지) → 청록 → 노랑 → 주황 → 빨강(활발)
+        def _mobility_rgba(norm: np.ndarray, alpha_boost: float = 1.0) -> np.ndarray:
+            sv = [0.00, 0.25, 0.50, 0.75, 1.00]
+            sr = [  30,   20,  100,  255,  220]   # 파→청→노→주→빨
+            sg = [  60,  160,  220,  120,    0]
+            sb = [ 180,  200,   30,    0,    0]
+            r = np.interp(norm, sv, sr).astype(np.uint8)
+            g = np.interp(norm, sv, sg).astype(np.uint8)
+            b = np.interp(norm, sv, sb).astype(np.uint8)
+            a = np.where(
+                norm < 0.003,
+                np.uint8(0),
+                np.clip(
+                    np.power(norm.astype(np.float32), 0.5) * 240 * alpha_boost,
+                    0, 240,
+                ).astype(np.uint8),
+            )
+            return np.stack([r, g, b, a], axis=-1)
+
+        def _blur_and_scale(arr: np.ndarray, sigma_px: float) -> np.ndarray:
+            blurred = gaussian_filter(arr, sigma=sigma_px)
+            b_max   = blurred.max()
+            if b_max <= 0:
+                return blurred
+            return np.clip((blurred / b_max) * scale, 0.0, 1.0)
+
+        # Layer 1 — 외곽 Glow
+        glow      = _blur_and_scale(intensity, sigma_px=130 * SCALE)
+        rgba_glow = _mobility_rgba(glow, alpha_boost=0.7)
+        pil_glow  = PIL.Image.fromarray(rgba_glow, "RGBA")
+        pil_glow  = pil_glow.resize((IMG_W, IMG_H), PIL.Image.BILINEAR)
+        fig.add_layout_image(dict(
+            source=pil_glow, xref="x", yref="y",
+            x=0, y=0, sizex=IMG_W, sizey=IMG_H,
+            sizing="stretch", opacity=0.85, layer="above",
+        ))
+
+        # Layer 2 — 핫 코어
+        core      = _blur_and_scale(intensity, sigma_px=48 * SCALE)
+        rgba_core = _mobility_rgba(core, alpha_boost=1.0)
+        pil_core  = PIL.Image.fromarray(rgba_core, "RGBA")
+        pil_core  = pil_core.resize((IMG_W, IMG_H), PIL.Image.BILINEAR)
+        fig.add_layout_image(dict(
+            source=pil_core, xref="x", yref="y",
+            x=0, y=0, sizex=IMG_W, sizey=IMG_H,
+            sizing="stretch", opacity=0.97, layer="above",
+        ))
+
+        # ── 투명 Hover 마커 ──────────────────────────────────────────────────
+        hour_label = f"{selected_hour:02d}시" if selected_hour is not None else "전체"
+        fig.add_trace(go.Scatter(
+            x=active["x"].tolist(), y=active["y"].tolist(),
+            mode="markers", name="S-Ward",
+            marker=dict(size=18, opacity=0.0, color="rgba(0,0,0,0)"),
+            text=active["name"].tolist(),
+            customdata=np.stack([
+                active["avg_mobility"].values,
+                active["mac_count"].values,
+            ], axis=1),
+            hovertemplate=(
+                "<b>S-Ward %{text}</b><br>"
+                f"시간: {hour_label}<br>"
+                "이동성 지수: %{customdata[0]:.1f}<br>"
+                "관측 MAC: %{customdata[1]:,}<extra></extra>"
+            ),
+        ))
+
+    # ── 컬러바 전용 더미 trace ────────────────────────────────────────────────
+    # Gaussian blur 이미지 오버레이는 Plotly colorbar를 지원하지 않으므로
+    # 투명 scatter에 colorscale을 붙여 범례 역할만 수행
+    _cb_vals = np.linspace(0, 100, 6)
+    _cb_colors = [
+        "rgb(30,60,180)",    # 0  — 정지
+        "rgb(20,160,200)",   # 20
+        "rgb(100,220,30)",   # 40
+        "rgb(255,120,0)",    # 60
+        "rgb(220,0,0)",      # 80 — 활발
+        "rgb(220,0,0)",      # 100
+    ]
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode="markers",
+        marker=dict(
+            colorscale=[
+                [0.00, "rgb(30,60,180)"],
+                [0.25, "rgb(20,160,200)"],
+                [0.50, "rgb(100,220,30)"],
+                [0.75, "rgb(255,120,0)"],
+                [1.00, "rgb(220,0,0)"],
+            ],
+            cmin=0, cmax=100,
+            color=[0],
+            colorbar=dict(
+                title      = dict(text="이동성 지수", side="right"),
+                thickness  = 14,
+                len        = 0.55,
+                x          = 1.01,
+                tickvals   = [0, 25, 50, 75, 100],
+                ticktext   = ["정지", "느림", "보통", "빠름", "활발"],
+                tickfont   = dict(size=11),
+                bgcolor    = "rgba(14,17,23,0.7)",
+                bordercolor= "rgba(255,255,255,0.15)",
+                borderwidth= 1,
+            ),
+            showscale=True,
+            size=1,
+            opacity=0.0,
+        ),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    hour_label = f"{selected_hour:02d}시" if selected_hour is not None else "전체 시간"
+    fig.update_layout(**_base(
+        title         = f"이동성 지수 Heatmap — {hour_label}",
+        height        = 1900,
+        paper_bgcolor = "#0a0a0f",
+        plot_bgcolor  = "#0a0a0f",
+        margin        = dict(l=10, r=50, t=40, b=10),
+        showlegend    = False,
+    ))
+    return fig
+
+
+def _rssi_range_to_speed(rssi_range: "np.ndarray | float") -> "np.ndarray | float":
+    """RSSI 변화량 합산(dBm) → 추정 보행 속도(km/h).
+
+    v6 지표: (MAC, S-Ward, 5분 윈도우) 별 max-min 범위를 S-Ward 합산한 값.
+    정규화 없이 고정 스케일 — 날짜 간 비교 가능.
+
+    군항제 축제 환경 기준 보정 (S-Ward 간격 ~50~100m):
+          0~ 5 dBm : 정지 / 거의 이동 없음       → 0.1~0.4 km/h
+          5~15 dBm : 매우 느린 이동 (극혼잡)      → 0.4~0.8 km/h
+         15~35 dBm : 느린 보행 (혼잡)            → 0.8~1.5 km/h
+         35~60 dBm : 보통 보행                   → 1.5~2.5 km/h
+         60~90 dBm : 빠른 보행                   → 2.5~3.8 km/h
+         90+   dBm : 빠른 이동 / 뛰기            → 3.8~5.0 km/h
+
+    ※ 브레이크포인트는 현장 보정 가능 (movement_analyzer.py RSSI_SCALE_MAX 참조)
+    """
+    bp  = [0,   5,   15,  35,  60,  90,  130]
+    spd = [0.1, 0.4, 0.8, 1.5, 2.5, 3.8, 5.0]
+    return np.interp(rssi_range, bp, spd)
+
+
+# 하위 호환 alias (v3~v5 캐시용 — 새 코드는 _rssi_range_to_speed 사용)
+def _rssi_std_to_speed(rssi_std: "np.ndarray | float") -> "np.ndarray | float":
+    """구버전(v3~v5) std 기반 환산. 신규 코드는 _rssi_range_to_speed 사용."""
+    bp  = [0,   2,   5,   10,  18,  25,  40 ]
+    spd = [0.1, 0.3, 0.8, 1.8, 3.2, 4.5, 5.0]
+    return np.interp(rssi_std, bp, spd)
+
+
+def _mobility_to_speed(mob: "np.ndarray | float") -> "np.ndarray | float":
+    """이동성 지수(0~100) → 추정 보행 속도(km/h).
+
+    군항제 축제 환경 보정:
+    - 피크 혼잡(mob 0~20): 0.1~0.5 km/h  — 거의 정지 / 떠밀리는 수준
+    - 혼잡(20~40):          0.5~1.2 km/h  — 매우 느린 보행
+    - 보통(40~60):          1.2~2.5 km/h  — 느린 보행
+    - 여유(60~80):          2.5~3.8 km/h  — 정상 보행
+    - 자유(80~100):         3.8~5.0 km/h  — 빠른 보행
+
+    BLE S-Ward 간격 ~50~100m 기준 RSSI 변화율과 대응.
+    일반 보행 자유속도 5 km/h(Weidmann 기준) 상한 적용.
+    """
+    bp  = [0,   20,  40,  60,  80, 100]
+    spd = [0.1, 0.5, 1.2, 2.5, 3.8, 5.0]
+    return np.interp(mob, bp, spd)
+
+
+def _speed_level(speed_kmh: float) -> tuple[str, str]:
+    """속도 → (레벨명, 색상)"""
+    if speed_kmh < 0.5:
+        return "극혼잡 · 거의 정지", "#cc2222"
+    elif speed_kmh < 1.2:
+        return "혼잡 · 매우 느린 보행", "#e86020"
+    elif speed_kmh < 2.5:
+        return "보통 · 느린 보행", "#e8c020"
+    elif speed_kmh < 3.8:
+        return "여유 · 정상 보행", "#60c840"
+    else:
+        return "자유 · 빠른 보행", "#4080e0"
+
+
+def chart_speed_distribution(
+    mac_mobility_df: pd.DataFrame,
+    zone: str,
+    hour: int,
+) -> go.Figure:
+    """
+    MAC별 RSSI std → 추정 보행속도 분포 (히스토그램 + 바이올린).
+
+    Parameters
+    ----------
+    mac_mobility_df : mac_address, hour, zone, rssi_range_mean
+                      (load_mac_mobility_cache 로드 후 전달)
+    zone  : 'A구역' … 'E구역'
+    hour  : 0~23
+    """
+    from config import ZONE_LABELS
+
+    SPEED_BINS   = [0,   0.5, 1.2, 2.5, 3.8, 5.1]
+    SPEED_LABELS = ["극혼잡 (<0.5)", "혼잡 (0.5~1.2)", "보통 (1.2~2.5)", "여유 (2.5~3.8)", "자유 (>3.8)"]
+    SPEED_COLORS = ["#cc2222", "#e86020", "#d4c020", "#60c840", "#4080e0"]
+
+    empty_fig = go.Figure()
+    empty_fig.update_layout(**_base())
+
+    if mac_mobility_df.empty:
+        return empty_fig
+
+    zone_df = mac_mobility_df[
+        (mac_mobility_df["hour"] == hour) &
+        (mac_mobility_df["zone"] == zone)
+    ].copy()
+
+    if zone_df.empty:
+        empty_fig.update_layout(title=f"{ZONE_LABELS.get(zone, zone)} — {hour:02d}시 데이터 없음")
+        return empty_fig
+
+    # rssi_range_mean → 추정 속도 (고정 스케일 직접 환산, 날짜 간 비교 가능)
+    col = "rssi_range_mean" if "rssi_range_mean" in zone_df.columns else "rssi_std_mean"
+    fn  = _rssi_range_to_speed if col == "rssi_range_mean" else _rssi_std_to_speed
+    zone_df["speed_kmh"] = fn(zone_df[col].values)
+    n_mac = len(zone_df)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        column_widths=[0.68, 0.32],
+        subplot_titles=[f"MAC별 추정 보행속도 분포 (n={n_mac:,}명)", "속도 요약"],
+    )
+
+    # ── 히스토그램 — 혼잡 레벨별 색상 ───────────────────────────────────────
+    for lo, hi, label, color in zip(
+        SPEED_BINS[:-1], SPEED_BINS[1:], SPEED_LABELS, SPEED_COLORS
+    ):
+        sub = zone_df[(zone_df["speed_kmh"] >= lo) & (zone_df["speed_kmh"] < hi)]
+        if sub.empty:
+            continue
+        pct = len(sub) / n_mac * 100
+        fig.add_trace(go.Histogram(
+            x            = sub["speed_kmh"],
+            name         = f"{label} ({pct:.1f}%)",
+            xbins        = dict(start=lo, end=hi, size=0.1),
+            marker_color = color,
+            opacity      = 0.85,
+            hovertemplate= f"속도: %{{x:.2f}} km/h<br>MAC 수: %{{y:,}}<extra>{label}</extra>",
+        ), row=1, col=1)
+
+    # 기준선
+    for x_val, lbl in [(0.5, "혼잡"), (1.2, "보통"), (2.5, "여유"), (3.8, "자유")]:
+        fig.add_vline(
+            x=x_val, line_dash="dot", line_color="rgba(255,255,255,0.25)",
+            line_width=1, row=1, col=1,
+            annotation_text=lbl, annotation_position="top",
+            annotation_font=dict(size=9, color="rgba(255,255,255,0.45)"),
+        )
+
+    # ── 바이올린 + 개별점 ────────────────────────────────────────────────────
+    fig.add_trace(go.Violin(
+        y         = zone_df["speed_kmh"],
+        name      = "분포",
+        box_visible    = True,
+        meanline_visible = True,
+        points    = "all" if n_mac <= 300 else False,
+        jitter    = 0.3,
+        marker    = dict(size=4, opacity=0.4, color="#aaaaaa"),
+        line_color = "#aaaaaa",
+        fillcolor  = "rgba(100,100,140,0.25)",
+        showlegend = False,
+        hovertemplate = "속도: %{y:.2f} km/h<extra></extra>",
+    ), row=1, col=2)
+
+    zone_label = ZONE_LABELS.get(zone, zone)
+    fig.update_layout(**_base(
+        height  = 400,
+        title   = dict(text=f"{zone_label} — {hour:02d}시 추정 보행속도 분포", font=dict(size=14)),
+        barmode = "overlay",
+        xaxis   = dict(title="추정 보행속도 (km/h)", range=[0, 5.2]),
+        yaxis   = dict(title="MAC 수 (명)"),
+        xaxis2  = dict(showticklabels=False, title=""),
+        yaxis2  = dict(title="속도 (km/h)", range=[0, 5.2]),
+        legend  = dict(orientation="h", x=0, y=-0.22, font=dict(size=10)),
+        margin  = dict(l=50, r=20, t=65, b=90),
+    ))
+    return fig
+
+
+def chart_mobility_hourly(mobility_df: pd.DataFrame) -> go.Figure:
+    """시간대별 전체 평균 이동성 지수 라인 차트.
+
+    y축: 데이터 범위에 맞춰 자동 조정 (0~100 고정 시 실제 변화가 눈에 안 띔).
+    참고선으로 전체 평균을 표시해 시간대별 상대적 높낮이를 명확히 함.
+    """
+    if mobility_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**_base())
+        return fig
+
+    hourly = (
+        mobility_df.groupby("hour")
+        .apply(lambda g: pd.Series({
+            "avg_mobility": (
+                np.average(g["avg_mobility"], weights=g["mac_count"])
+                if g["mac_count"].sum() > 0 else 0.0
+            ),
+            "mac_count": g["mac_count"].sum(),
+        }))
+        .reset_index()
+    )
+
+    y_min  = hourly["avg_mobility"].min()
+    y_max  = hourly["avg_mobility"].max()
+    y_mean = hourly["avg_mobility"].mean()
+    margin = max((y_max - y_min) * 0.3, 2.0)   # 여백
+    y_lo   = max(0.0, y_min - margin)
+    y_hi   = min(100.0, y_max + margin)
+
+    fig = go.Figure()
+
+    # 평균 기준선
+    fig.add_hline(
+        y=y_mean, line_dash="dot",
+        line_color="rgba(255,255,255,0.25)", line_width=1,
+        annotation_text=f"평균 {y_mean:.1f}",
+        annotation_position="right",
+        annotation_font=dict(size=9, color="rgba(255,255,255,0.4)"),
+    )
+
+    fig.add_trace(go.Scatter(
+        x    = hourly["hour"],
+        y    = hourly["avg_mobility"],
+        mode = "lines+markers",
+        name = "평균 이동성",
+        line = dict(color="#e5604a", width=2.5),
+        marker = dict(size=6),
+        fill = "tozeroy",
+        fillcolor = "rgba(229,96,74,0.12)",
+        hovertemplate = "%{x:02d}시  이동성: %{y:.1f}<extra></extra>",
+    ))
+    fig.update_layout(**_base(
+        height = 320,
+        title  = dict(text="시간대별 평균 이동성 지수", font=dict(size=14)),
+        xaxis  = dict(title="시간", dtick=2, range=[-0.5, 23.5]),
+        yaxis  = dict(title="이동성 지수", range=[y_lo, y_hi]),
+    ))
+    return fig
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 구역 체류시간
+# ════════════════════════════════════════════════════════════════════════════
+
+def chart_zone_dwell_bar(dwell_df: pd.DataFrame, zone_colors: dict) -> go.Figure:
+    """구역별 평균·중앙값 체류시간 바 차트."""
+    from config import ALL_ZONES, ZONE_LABELS
+
+    if dwell_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**_base())
+        return fig
+
+    dwell_df = dwell_df.copy()
+    dwell_df["dwell_min"] = dwell_df["dwell_s"] / 60
+
+    stats = (
+        dwell_df[dwell_df["zone"].isin(ALL_ZONES)]
+        .groupby("zone")["dwell_min"]
+        .agg(mean="mean", median="median", count="count", q75=lambda x: x.quantile(0.75))
+        .reset_index()
+    )
+    stats["zone_label"] = stats["zone"].map(ZONE_LABELS)
+    stats = stats.set_index("zone").reindex(ALL_ZONES).dropna().reset_index()
+    stats["zone_label"] = stats["zone"].map(ZONE_LABELS)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x         = stats["zone_label"],
+        y         = stats["mean"],
+        name      = "평균",
+        marker_color = [zone_colors.get(z, "#888") for z in stats["zone"]],
+        opacity   = 0.85,
+        text      = stats["mean"].apply(lambda v: f"{v:.1f}분"),
+        textposition = "outside",
+    ))
+    fig.add_trace(go.Scatter(
+        x    = stats["zone_label"],
+        y    = stats["median"],
+        mode = "markers",
+        name = "중앙값",
+        marker = dict(symbol="diamond", size=10, color="#f0c040"),
+    ))
+    fig.update_layout(
+        **_base(height=380),
+        title      = dict(text="구역별 체류시간 (평균·중앙값)", font=dict(size=14)),
+        yaxis      = dict(title="체류시간 (분)"),
+        xaxis      = dict(title=""),
+        barmode    = "group",
+        legend     = dict(orientation="h", x=0.7, y=1.08),
+    )
+    return fig
+
+
+def chart_zone_dwell_box(dwell_df: pd.DataFrame, zone_colors: dict) -> go.Figure:
+    """구역별 체류시간 분포 박스플롯."""
+    from config import ALL_ZONES, ZONE_LABELS
+
+    if dwell_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**_base())
+        return fig
+
+    dwell_df = dwell_df.copy()
+    dwell_df["dwell_min"] = dwell_df["dwell_s"] / 60
+
+    fig = go.Figure()
+    for zone in ALL_ZONES:
+        zdata = dwell_df[dwell_df["zone"] == zone]["dwell_min"]
+        if zdata.empty:
+            continue
+        fig.add_trace(go.Box(
+            y           = zdata,
+            name        = ZONE_LABELS.get(zone, zone),
+            marker_color= zone_colors.get(zone, "#888"),
+            boxmean     = "sd",
+            line        = dict(width=1.5),
+        ))
+
+    fig.update_layout(
+        **_base(height=420),
+        title  = dict(text="구역별 체류시간 분포", font=dict(size=14)),
+        yaxis  = dict(title="체류시간 (분)", range=[0, None]),
+        xaxis  = dict(title=""),
+        showlegend = False,
+    )
+    return fig
+
+
+def chart_zone_dwell_heatmap(dwell_df: pd.DataFrame, zone_colors: dict) -> go.Figure:
+    """구역 × 시간대 체류시간 히트맵 (평균)."""
+    from config import ALL_ZONES, ZONE_LABELS
+
+    if dwell_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**_base())
+        return fig
+
+    dwell_df = dwell_df.copy()
+    dwell_df["dwell_min"] = dwell_df["dwell_s"] / 60
+
+    pivot = (
+        dwell_df[dwell_df["zone"].isin(ALL_ZONES)]
+        .groupby(["zone", "hour_start"])["dwell_min"]
+        .mean()
+        .unstack(fill_value=0)
+    )
+    pivot = pivot.reindex(ALL_ZONES).fillna(0)
+    zone_labels = [ZONE_LABELS.get(z, z) for z in pivot.index]
+
+    fig = go.Figure(go.Heatmap(
+        z           = pivot.values,
+        x           = [f"{h:02d}시" for h in pivot.columns],
+        y           = zone_labels,
+        colorscale  = "YlOrRd",
+        colorbar    = dict(title="체류시간<br>(분)", thickness=14),
+        hoverongaps = False,
+        hovertemplate = "%{y} %{x}<br>평균 체류: %{z:.1f}분<extra></extra>",
+    ))
+    fig.update_layout(
+        **_base(height=300),
+        title = dict(text="구역 × 시간대 평균 체류시간 (분)", font=dict(size=14)),
+        xaxis = dict(title=""),
+        yaxis = dict(title=""),
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 누적 체류시간 차트 (분단위 MAC 카운트 기반)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chart_cumulative_daily(cum_df: pd.DataFrame, zone_labels: dict) -> go.Figure:
+    """구역별 하루 누적 체류시간 (person-hours) 막대 차트."""
+    if cum_df.empty:
+        return go.Figure().update_layout(**_base(title="데이터 없음"))
+
+    daily = (
+        cum_df.groupby("zone")["mac_count"].sum().reset_index()
+    )
+    daily["person_hour"] = (daily["mac_count"] / 60).round(1)
+    daily["label"] = daily["zone"].map(lambda z: zone_labels.get(z, z))
+    daily = daily.sort_values("zone")
+
+    from config import ZONE_COLORS
+    colors = [ZONE_COLORS.get(z, "#888888") for z in daily["zone"]]
+
+    fig = go.Figure(go.Bar(
+        x=daily["label"],
+        y=daily["person_hour"],
+        marker_color=colors,
+        text=daily["person_hour"].apply(lambda v: f"{v:,.0f}h"),
+        textposition="outside",
+    ))
+    fig.update_layout(
+        **_base(title="구역별 일 누적 체류시간"),
+        yaxis_title="누적 체류시간 (person-hours)",
+        xaxis_title="구역",
+    )
+    return fig
+
+
+def chart_cumulative_hourly(cum_df: pd.DataFrame, zone_labels: dict) -> go.Figure:
+    """구역별 시간당 누적 체류시간 라인 차트."""
+    if cum_df.empty:
+        return go.Figure().update_layout(**_base(title="데이터 없음"))
+
+    df = cum_df.copy()
+    df["hour"] = df["minute"] // 60
+    hourly = df.groupby(["zone", "hour"])["mac_count"].sum().reset_index()
+    hourly["person_hour"] = (hourly["mac_count"] / 60).round(2)
+
+    from config import ZONE_COLORS
+    fig = go.Figure()
+    for zone in sorted(hourly["zone"].unique()):
+        sub = hourly[hourly["zone"] == zone].sort_values("hour")
+        fig.add_trace(go.Scatter(
+            x=sub["hour"],
+            y=sub["person_hour"],
+            mode="lines+markers",
+            name=zone_labels.get(zone, zone),
+            line=dict(color=ZONE_COLORS.get(zone, "#888888"), width=2),
+            marker=dict(size=6),
+        ))
+    fig.update_layout(
+        **_base(title="구역별 시간당 누적 체류시간"),
+        xaxis=dict(title="시간", tickmode="linear", dtick=1),
+        yaxis_title="누적 체류시간 (person-hours)",
+        legend=dict(orientation="h", y=-0.15),
+    )
+    return fig
+
+
+def chart_cumulative_30min(cum_df: pd.DataFrame, zone: str, zone_labels: dict) -> go.Figure:
+    """특정 구역의 30분 단위 누적 체류시간 막대 차트."""
+    if cum_df.empty:
+        return go.Figure().update_layout(**_base(title="데이터 없음"))
+
+    from config import ZONE_COLORS
+    df = cum_df[cum_df["zone"] == zone].copy()
+    if df.empty:
+        return go.Figure().update_layout(**_base(title=f"{zone_labels.get(zone, zone)} 데이터 없음"))
+
+    df["slot_30"] = df["minute"] // 30  # 0~47
+    slot = df.groupby("slot_30")["mac_count"].sum().reset_index()
+    slot["person_hour"] = (slot["mac_count"] / 60).round(2)
+    slot["label"] = slot["slot_30"].apply(
+        lambda s: f"{s // 2:02d}:{(s % 2)*30:02d}"
+    )
+
+    color = ZONE_COLORS.get(zone, "#4080e0")
+    fig = go.Figure(go.Bar(
+        x=slot["label"],
+        y=slot["person_hour"],
+        marker_color=color,
+        opacity=0.85,
+    ))
+    fig.update_layout(
+        **_base(title=f"{zone_labels.get(zone, zone)} — 30분 단위 누적 체류시간"),
+        xaxis=dict(title="시간대", tickangle=-45),
+        yaxis_title="누적 체류시간 (person-hours)",
+    )
+    return fig
+
+
+def chart_zone_highlight(swards_df: pd.DataFrame, highlight_zone: str | None = None) -> go.Figure:
+    """구역 위치 안내 지도 — highlight_zone 을 강조 표시.
+
+    Parameters
+    ----------
+    swards_df      : name, x, y 컬럼 포함 S-Ward 좌표 DataFrame
+    highlight_zone : 강조할 구역 키 ('A구역' 등). None 이면 전체 동일 표시.
+    """
+    import config as _cfg
+
+    img_path = Path(__file__).parent / "Data" / "Ground.png"
+    fig = go.Figure()
+
+    img = _load_ground_image(str(img_path))
+    if img is not None:
+        w, h = img.size
+        fig.add_layout_image(dict(
+            source=img, xref="x", yref="y",
+            x=0, y=0, sizex=w, sizey=h,
+            sizing="stretch", opacity=0.35, layer="below",
+        ))
+        fig.update_xaxes(range=[0, w], showgrid=False, zeroline=False, visible=False)
+        fig.update_yaxes(range=[h, 0], showgrid=False, zeroline=False,
+                         scaleanchor="x", visible=False)
+    else:
+        w, h = 3319, 6599
+        fig.update_xaxes(range=[0, w], showgrid=False, zeroline=False, visible=False)
+        fig.update_yaxes(range=[h, 0], showgrid=False, zeroline=False,
+                         scaleanchor="x", visible=False)
+
+    if swards_df.empty:
+        fig.update_layout(**_base(title="지도 데이터 없음", height=500))
+        return fig
+
+    valid = swards_df[(swards_df["x"] > 0) | (swards_df["y"] > 0)].copy()
+    valid["zone"] = valid["name"].astype(str).map(
+        lambda n: next((z for z, sw in _cfg.ZONE_SWARDS.items() if n in sw), "미분류")
+    )
+    valid = valid[valid["zone"] != "미분류"]
+
+    for zone, grp in valid.groupby("zone"):
+        is_highlight = (highlight_zone is None) or (zone == highlight_zone)
+        color   = ZONE_COLORS.get(zone, "#888888")
+        opacity = 1.0 if is_highlight else 0.18
+        size    = 18  if is_highlight else 10
+        border  = dict(color="white", width=2) if is_highlight else dict(color="#555", width=1)
+
+        fig.add_trace(go.Scatter(
+            x=grp["x"], y=grp["y"],
+            mode="markers+text" if is_highlight else "markers",
+            name=ZONE_LABELS.get(zone, zone),
+            marker=dict(color=color, size=size, opacity=opacity, line=border),
+            text=grp["name"] if is_highlight else None,
+            textposition="top center",
+            textfont=dict(size=9, color="white"),
+            hovertemplate=(
+                f"<b>{ZONE_LABELS.get(zone, zone)}</b><br>"
+                "S-Ward: %{text}<extra></extra>"
+            ) if is_highlight else f"{ZONE_LABELS.get(zone, zone)}<extra></extra>",
+            showlegend=True,
+        ))
+
+    title = (
+        f"구역 위치 — {ZONE_LABELS.get(highlight_zone, highlight_zone)} 강조"
+        if highlight_zone else "전체 구역 위치"
+    )
+    fig.update_layout(**_base(title=title, height=480,
+                              paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR))
+    fig.update_layout(
+        legend=dict(orientation="h", y=-0.05, font=dict(size=11)),
+        margin=dict(l=0, r=0, t=40, b=30),
+    )
+    return fig
