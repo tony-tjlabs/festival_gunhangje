@@ -1281,5 +1281,38 @@ def main() -> None:
         render_zone_dwell(data)
 
 
+# ── 비밀번호 게이트 ───────────────────────────────────────────────────────────
+
+def _check_password() -> bool:
+    """Streamlit Secrets의 password와 사용자 입력을 비교.
+
+    secrets.toml (로컬) 또는 Streamlit Cloud Secrets에
+        password = "YOUR_PASSWORD"
+    를 설정해야 한다.
+    """
+    # secrets에 password 키가 없으면 비밀번호 보호 비활성화 (로컬 개발 편의)
+    try:
+        correct_pw = st.secrets["password"]
+    except (KeyError, FileNotFoundError):
+        return True  # secrets 미설정 시 바이패스
+
+    # 이미 인증된 세션이면 즉시 통과
+    if st.session_state.get("authenticated"):
+        return True
+
+    # 비밀번호 입력 UI
+    st.title(APP_ICON + " " + APP_TITLE)
+    st.markdown("### 🔒 접속 비밀번호를 입력하세요")
+    pw = st.text_input("비밀번호", type="password", key="_pw_input")
+    if st.button("확인", key="_pw_btn"):
+        if pw == correct_pw:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+    return False
+
+
 if __name__ == "__main__":
-    main()
+    if _check_password():
+        main()
