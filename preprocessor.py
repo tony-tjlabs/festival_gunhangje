@@ -19,6 +19,19 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+# ── 클라우드 배포용 스텁 ───────────────────────────────────────────────────────
+# 실제 빌드 로직은 로컬 SandBox에서만 실행. 배포 환경에서는 호출되지 않음.
+
+def build_cache(base_dir: Path, progress_callback=None) -> bool:
+    """배포 환경에서는 사용 불가 (캐시 사전 생성 필요)."""
+    raise NotImplementedError("Cloud mode: caches are pre-built locally.")
+
+
+def discover_dates(base_dir: Path) -> list:
+    """배포 환경에서는 Data/ 폴더 없음 → 빈 리스트 반환."""
+    return []
+
+
 # ── 경로 ────────────────────────────────────────────────────────────────────
 
 def get_cache_dir(base: Path) -> Path:
