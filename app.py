@@ -1313,6 +1313,6 @@ def _check_password() -> bool:
     return False
 
 
-if __name__ == "__main__":
-    if _check_password():
-        main()
+# Streamlit은 __name__ == "__main__" 블록을 실행하지 않음 → 모듈 레벨에서 직접 호출
+if _check_password():
+    main()
