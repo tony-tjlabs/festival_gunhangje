@@ -996,9 +996,10 @@ def render_ai(data: dict) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 
 def render_movement(data: dict) -> None:
-    daily_df  = data["daily"]
-    all_dates = sorted(daily_df["date"].unique().tolist())
-    swards_df = _load_swards()
+    daily_df   = data["daily"]
+    weather_df = data["weather"]
+    all_dates  = sorted(daily_df["date"].unique().tolist())
+    swards_df  = _load_swards()
 
     st.header("이동 속도 분석")
 
@@ -1006,6 +1007,7 @@ def render_movement(data: dict) -> None:
     sel_date = st.selectbox(
         "날짜 선택",
         options=["전체 기간"] + all_dates,
+        format_func=lambda d: d if d == "전체 기간" else make_date_label(d, weather_df),
         key="mv_date",
     )
     targets = all_dates if sel_date == "전체 기간" else [sel_date]
@@ -1103,6 +1105,7 @@ def render_zone_dwell(data: dict) -> None:
     sel_date = st.selectbox(
         "날짜 선택",
         options=["전체 기간"] + all_dates,
+        format_func=lambda d: d if d == "전체 기간" else make_date_label(d, weather_df),
         key="dw_date",
     )
     targets = all_dates if sel_date == "전체 기간" else [sel_date]
@@ -1258,7 +1261,7 @@ def main() -> None:
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "개요", "시간대 분석", "유입/유출", "구역별 분석",
         "동선 분석", "날씨 영향", "AI 인사이트",
-        "🏃 이동 속도", "🕐 구역 체류시간",
+        "🏃 이동 속도", "🕐 체류시간 분석",
     ])
 
     with tab1:
