@@ -88,6 +88,14 @@ def load_zone_cumulative_cache(base_dir: Path, date_str: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# ── 클라우드 배포용 스텁 ───────────────────────────────────────────────────────
+# 실제 계산 로직은 로컬 SandBox에서만 실행. 배포 환경에서는 호출되지 않음.
+
+def compute_and_cache(base_dir: Path, date_str: str) -> bool:
+    """배포 환경에서는 사용 불가 (캐시 사전 생성 필요)."""
+    raise NotImplementedError("Cloud mode: caches are pre-built locally.")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 속도 환산 유틸
 # ════════════════════════════════════════════════════════════════════════════
