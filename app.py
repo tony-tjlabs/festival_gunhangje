@@ -1283,36 +1283,38 @@ def main() -> None:
 
 # ── 비밀번호 게이트 ───────────────────────────────────────────────────────────
 
-def _check_password() -> bool:
-    """Streamlit Secrets의 password와 사용자 입력을 비교.
+def _check_password() -> None:
+    """비밀번호 게이트. 인증 실패 시 st.stop()으로 이후 실행 완전 차단.
 
-    secrets.toml (로컬) 또는 Streamlit Cloud Secrets에
+    Streamlit Cloud Secrets 또는 .streamlit/secrets.toml 에
         password = "YOUR_PASSWORD"
-    를 설정해야 한다.
+    를 설정해야 한다. 키가 없으면 보호 없이 통과 (로컬 개발용).
     """
-    # secrets에 password 키가 없으면 비밀번호 보호 비활성화 (로컬 개발 편의)
-    try:
-        correct_pw = st.secrets["password"]
-    except (KeyError, FileNotFoundError):
-        return True  # secrets 미설정 시 바이패스
+    # secrets에 password 키가 없으면 보호 비활성화
+    if "password" not in st.secrets:
+        return
+
+    correct_pw = st.secrets["password"]
 
     # 이미 인증된 세션이면 즉시 통과
-    if st.session_state.get("authenticated"):
-        return True
+    if st.session_state.get("_authenticated"):
+        return
 
-    # 비밀번호 입력 UI
+    # ── 비밀번호 입력 UI ─────────────────────────────────────────────────────
     st.title(APP_ICON + " " + APP_TITLE)
     st.markdown("### 🔒 접속 비밀번호를 입력하세요")
-    pw = st.text_input("비밀번호", type="password", key="_pw_input")
-    if st.button("확인", key="_pw_btn"):
+    pw = st.text_input("비밀번호", type="password", key="_pw_input",
+                       placeholder="비밀번호 입력 후 Enter 또는 확인 클릭")
+    if st.button("확인", key="_pw_btn", type="primary"):
         if pw == correct_pw:
-            st.session_state["authenticated"] = True
+            st.session_state["_authenticated"] = True
             st.rerun()
         else:
             st.error("비밀번호가 틀렸습니다.")
-    return False
+    # 인증 전까지 이후 모든 코드 실행 차단
+    st.stop()
 
 
-# Streamlit은 __name__ == "__main__" 블록을 실행하지 않음 → 모듈 레벨에서 직접 호출
-if _check_password():
-    main()
+# ── 진입점 (모듈 레벨 — Streamlit은 __name__ != "__main__") ─────────────────
+_check_password()
+main()
